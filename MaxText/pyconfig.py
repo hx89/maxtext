@@ -195,6 +195,7 @@ def validate_model_name(s: str) -> bool:
       "llama2-7b",
       "llama2-13b",
       "llama2-70b",
+      "llama2-70b-8-layers",
       "llama3-8b",
       "llama3-70b",
       "llama3.1-8b",
@@ -662,6 +663,9 @@ def set_and_validate_pipeline_config(raw_keys):
     assert (
         raw_keys["num_pipeline_microbatches"] % num_stages == 0
     ), f"The number of microbatches ({raw_keys['num_pipeline_microbatches']}) must be divisible by the number of stages ({num_stages})"
+
+    max_logging.log(f"raw_keys[\"micro_batch_size_to_train_on\"] is: {raw_keys["micro_batch_size_to_train_on"]}")
+
     assert (
         raw_keys["micro_batch_size_to_train_on"] % raw_keys["num_pipeline_microbatches"] == 0
     ), f"The batch size ({raw_keys['micro_batch_size_to_train_on']}) must be divisible by the number of microbatches ({raw_keys['num_pipeline_microbatches']})"

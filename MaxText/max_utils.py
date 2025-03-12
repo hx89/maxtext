@@ -1104,3 +1104,64 @@ def print_system_information():
   max_logging.log(f"System Information: Jax Version: {jax.__version__}")
   max_logging.log(f"System Information: Jaxlib Version: {jax.lib.__version__}")
   max_logging.log(f"System Information: Jax Backend: {jax.lib.xla_bridge.get_backend().platform_version}")
+
+
+def print_param_counts(param_dict, expand_keys=None, print_shapes=True, prefix=""):
+  """Prints the parameter counts for the model.
+  
+  Args:
+    param_dict: The parameter dictionary
+    expand_keys: A list of keys to expand and print individually
+    print_shapes: Whether to print shapes of parameters
+    prefix: Prefix for nested parameter names
+  """
+  total_params = 0
+  for k, v in param_dict.items():
+    full_key = f"{prefix}.{k}" if prefix else k
+    if isinstance(v, dict):
+      if expand_keys and k in expand_keys:
+        print(f"{full_key}:")
+        subtotal = print_param_counts(v, expand_keys, print_shapes, prefix=full_key)
+        print(f"{full_key} total: {subtotal:,}")
+      else:
+        subtotal = n_params(v, print_shapes=print_shapes, prefix=full_key)
+        print(f"{full_key}: {subtotal:,}")
+    else:
+      subtotal = np.size(v)
+      if print_shapes:
+        print(f"{full_key}: {subtotal:,} shape={v.shape} dtype={v.dtype}")
+      else:
+        print(f"{full_key}: {subtotal:,}")
+    total_params += subtotal
+  return total_params
+
+
+def n_params(pytree, print_shapes=False, prefix=""):
+  """Returns the total number of parameters in a pytree.
+
+  Args:
+    pytree: The pytree to count parameters in.
+    print_shapes: Whether to print shapes of parameters
+    prefix: Prefix for nested parameter names
+
+  Returns:
+    The total number of parameters.
+  """
+  if print_shapes:
+    # Use flatten_with_path to get both paths and values
+    flat_tree = jax.tree_util.tree_flatten_with_path(pytree)
+    total = 0
+    for path, array in zip(flat_tree[1], flat_tree[0]):
+      # Convert path to string representation
+      path_str = '.'.join([str(p) for p in path if not isinstance(p, int)])
+      full_path = f"{prefix}.{path_str}" if prefix and path_str else prefix or path_str
+      
+      # Print array information
+      print(f"{full_path}: shape={array.shape}, size={np.size(array):,}, dtype={array.dtype}")
+      total += np.size(array)
+    return total
+  else:
+    # Original behavior
+    return jax.tree_util.tree_reduce(
+        lambda x, y: x + y,
+        jax.tree_util.tree_map(lambda x: np.size(x), pytree))

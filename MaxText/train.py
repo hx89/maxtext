@@ -870,6 +870,16 @@ def train_loop(config, state=None):
       performance_metric_queue = queue.Queue()
       gcp_workload_monitor.start_performance_reporting_thread(performance_metric_queue)
 
+  print("Profiling configuration:")
+  print(f"  Profiler type: {config.profiler}")
+  print(f"  First profiling step: {first_profiling_step}")
+  print(f"  Last profiling step: {last_profiling_step}")
+  print(f"  Skip first N steps: {config.skip_first_n_steps_for_profiler}")
+  print(f"  Number of steps to profile: {config.profiler_steps}")
+  print(f"  Profile periodically period: {config.profile_periodically_period}")
+  print(f"  Profile cleanly: {config.profile_cleanly}")
+  print(f"  Upload all profiler results: {config.upload_all_profiler_results}")
+
   for step in np.arange(start_step, config.steps):
     if step == first_profiling_step or prof.should_activate_periodic_profile(step):
       optional_postfix = f"step_{step}" if config.profile_periodically_period > 0 else ""

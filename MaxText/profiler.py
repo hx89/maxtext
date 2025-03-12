@@ -43,12 +43,19 @@ class Profiler:
   def activate(self, blocking_object=None, optional_postfix=""):
     """Start the profiler.
     nsys profiler becomes no-op when libcudart.so is not available on the system"""
+
+    print(f"in activate, self.mode is: {self.mode}, self.upload_all_profiler_results is: {self.upload_all_profiler_results}, self.profile_cleanly is: {self.profile_cleanly}\n")
+
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    # if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    if not (self.upload_all_profiler_results):
       return
     if self.mode != "":
       self.output_path = os.path.join(self.base_output_dir, optional_postfix)
+
+    max_logging.log(f"start profiler, self.mode is: {self.mode}\n")
+    print(f"start profiler, self.mode is: {self.mode}\n")
     if self.mode == "nsys":
       try:
         self.libcudart = cdll.LoadLibrary("libcudart.so")
@@ -62,10 +69,17 @@ class Profiler:
   def deactivate(self, blocking_object=None):
     """End the profiler.
     The result is uploaded to the output bucket"""
+
+    print(f"in deactivate, self.mode is: {self.mode}, self.upload_all_profiler_results is: {self.upload_all_profiler_results}, self.profile_cleanly is: {self.profile_cleanly}\n")
+
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    # if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    if not (self.upload_all_profiler_results):
       return
+
+    max_logging.log(f"stop profiler, self.mode is: {self.mode}\n")
+    print(f"stop profiler, self.mode is: {self.mode}\n")
     if self.mode == "nsys":
       if self.libcudart is not None:
         self.libcudart.cudaProfilerStop()
