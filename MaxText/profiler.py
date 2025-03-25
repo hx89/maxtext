@@ -48,8 +48,8 @@ class Profiler:
 
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    # if not (self.upload_all_profiler_results or jax.process_index() == 0):
-    if not (self.upload_all_profiler_results):
+    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    # if not (self.upload_all_profiler_results):
       return
     if self.mode != "":
       self.output_path = os.path.join(self.base_output_dir, optional_postfix)
@@ -74,8 +74,8 @@ class Profiler:
 
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    # if not (self.upload_all_profiler_results or jax.process_index() == 0):
-    if not (self.upload_all_profiler_results):
+    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    # if not (self.upload_all_profiler_results):
       return
 
     max_logging.log(f"stop profiler, self.mode is: {self.mode}\n")

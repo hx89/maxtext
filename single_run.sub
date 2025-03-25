@@ -9,9 +9,9 @@
 #SBATCH --mail-type=FAIL        # only send email on failure
 #SBATCH --overcommit            # Needed for pytorch
 #SBATCH --ntasks-per-node=8    
-#SBATCH --gres=gpu:8 
 set -x
 
+EOS=1
 # CONTAINER=ghcr.io/nvidia/jax:base-2024-12-09
 # CONTAINER=ghcr.io/nvidia/jax:maxtext-2025-01-07
 # CONTAINER=ghcr.io/nvidia/jax:maxtext-2024-12-09
@@ -25,8 +25,14 @@ CONTAINER=ghcr.io/nvidia/jax:maxtext-2025-03-04
 # CONTAINER="gitlab-master.nvidia.com/dl/dgx/jax:jax|maxtext-2025-02-09"
 
 # << CHANGE ! >>
-BASE_WORKSPACE_DIR="/lustre/fsw/portfolios/coreai/users/haixinl/maxtext_workspace/pipeline"
-BASE_VOCAB_PATH="/lustre/fsw/portfolios/coreai/users/haixinl/dataset/google_c4_spm"
+if [ ${EOS} -gt 0 ];
+then
+  BASE_WORKSPACE_DIR="/lustre/fsw/coreai_dlalgo_llm/haixinl/maxtext_workspace/pipeline"
+  BASE_VOCAB_PATH="/lustre/fsw/coreai_dlalgo_llm/haixinl/dataset/google_c4_spm"
+else
+  BASE_WORKSPACE_DIR="/lustre/fsw/portfolios/coreai/users/haixinl/maxtext_workspace/pipeline"
+  BASE_VOCAB_PATH="/lustre/fsw/portfolios/coreai/users/haixinl/dataset/google_c4_spm"
+fi
 
 # Default env variables for paths required by pax training scripts
 WORKSPACE_DIR=/opt/workspace
