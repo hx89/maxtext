@@ -33,6 +33,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FUSED_ATTN=1
 export NCCL_IB_SL=1
 
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
 # export PYTHONFAULTHANDLER=1
 # export TF_CPP_VMODULE=gpu_latency_hiding_scheduler=8,latency_hiding_scheduler=8,all_reduce_combiner=8
 # export TF_CPP_VMODULE=gpu_executable=8,nccl_collectives=8,nccl_all_gather_thunk=8,nccl_all_reduce_thunk=8,nccl_all_to_all_thunk=8,nccl_api=8,nccl_api_stub=8,nccl_clique=8,nccl_collective_broadcast_thunk=8,nccl_collective_permute_thunk=8,nccl_collective_thunk=8,nccl_group_thunk=8,nccl_p2p_thunk_common=8,nccl_recv_thunk=8,nccl_send_thunk=8
@@ -53,13 +55,15 @@ export XLA_FLAGS="--xla_gpu_enable_latency_hiding_scheduler=true
                 --xla_gpu_enable_while_loop_double_buffering=false
                 --xla_gpu_enable_all_gather_combine_by_dim=false
                 --xla_gpu_enable_reduce_scatter_combine_by_dim=false
+                --xla_dump_hlo_as_text
+                --xla_dump_to=$HLO_DUMP_PATH
                 --xla_disable_hlo_passes=rematerialization"
+                # --xla_gpu_collective_permute_decomposer_threshold=0
+                # --xla_gpu_enable_pipelined_collectives=false
+                # --xla_gpu_experimental_pipeline_parallelism_opt_level=PIPELINE_PARALLELISM_OPT_LEVEL_ENABLE
                 # --xla_dump_hlo_as_text
                 # --xla_dump_to=$HLO_DUMP_PATH
                 # --xla_dump_hlo_pass_re=.*"
-                # --xla_gpu_collective_permute_decomposer_threshold=0
-                # --xla_gpu_enable_pipelined_collectives=false
-                # --xla_gpu_experimental_pipeline_parallelism_opt_level=PIPELINE_PARALLELISM_OPT_LEVEL_ENABLE"
 
 echo "XLA_FLAGS = ${XLA_FLAGS}"
 echo "XLA_PYTHON_CLIENT_MEM_FRACTION = ${XLA_PYTHON_CLIENT_MEM_FRACTION}"
@@ -68,7 +72,7 @@ echo "POLICY = ${POLICY}"
 RUN_SETTINGS="maxtext/MaxText/train.py maxtext/MaxText/configs/base.yml run_name=${RUN_NAME}-single-run use_iota_embed=true scan_layers=true\
     steps=15 per_device_batch_size=${MBS} model_name=llama2-70b-8-layers remat_policy=${POLICY} enable_checkpointing=false logits_dot_in_fp32=false\
     base_output_directory=local_train dataset_path=local dataset_type=synthetic attention=cudnn_flash_te tokenizer_path=maxtext/assets/tokenizer.llama2\
-    max_target_length=4096 quantization=${QUANTIZATION} hardware=gpu_multiprocess profiler=nsys skip_first_n_steps_for_profiler=9 profiler_steps=3\
+    max_target_length=4096 quantization=${QUANTIZATION} hardware=gpu profiler=nsys skip_first_n_steps_for_profiler=9 profiler_steps=3\
     enable_goodput_recording=false monitor_goodput=false num_layers_per_pipeline_stage=$((8/(dcn_PP*VP)))\
     dcn_fsdp_parallelism=${dcn_FSDP} ici_fsdp_parallelism=${ici_FSDP}\
     ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP}\
