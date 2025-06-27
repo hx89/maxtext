@@ -419,7 +419,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
-def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
+def train_step(model, config, state_mesh_shardings, state, data, dropout_rng, params_shardings=None):
   """
 
   Args:
@@ -480,8 +480,12 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
       if config.use_dpo:
         reference_params = jax.device_put(reference_params, max_utils.with_memory_kind(reference_params_sharding, "device"))
         extra_dpo_args = [reference_params]
+    params = state.params
+    if config.shard_optimizer_over_data:
+      params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
     grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
-    (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, *extra_dpo_args, is_train=True)
+    # (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, *extra_dpo_args, is_train=True)
+    (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
   intermediate_outputs = aux["intermediate_outputs"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
@@ -756,6 +760,8 @@ def train_loop(config, recorder, state=None):
       state = _merge_dpo_state(state, reference_params)
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
+  params_shardings, state_mesh_shardings = maxtext_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+
   # pylint: disable=line-too-long
   (
       functional_train,
@@ -763,7 +769,7 @@ def train_loop(config, recorder, state=None):
       out_shard_train,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config)
+  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config, params_shardings=params_shardings)
 
   if eval_data_iterator:
     # pylint: disable=line-too-long
