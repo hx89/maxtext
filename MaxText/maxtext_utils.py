@@ -777,6 +777,10 @@ def setup_initial_state(
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training
   )
+  with open("state_mesh_annotations-after-get_abstract_state.txt", "w") as f:
+      f.write(str(state_mesh_annotations))
+  with open("state_mesh_shardings-after-get_abstract_state.txt", "w") as f:
+      f.write(str(state_mesh_shardings))
 
   # Initialization
   with nn_partitioning.axis_rules(config.logical_axis_rules):
@@ -820,7 +824,11 @@ def setup_initial_state(
       if raw_params:  # If we loaded a partial state, we need to merge it.
         state = state.replace(params=raw_params)
 
+  with open("state-after-jit.txt", "w") as f:
+      f.write(str(state))
   state = max_utils.unbox_logicallypartioned(state)
+  with open("state-after-unbox_logicallypartioned.txt", "w") as f:
+      f.write(str(state))
 
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 

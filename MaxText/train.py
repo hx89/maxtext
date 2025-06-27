@@ -762,6 +762,11 @@ def train_loop(config, recorder, state=None):
 
   params_shardings, state_mesh_shardings = maxtext_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
+  with open("params_shardings-after-maybe_update_params_sharding_with_opt.txt", "w") as f:
+      f.write(str(params_shardings))
+  with open("state_mesh_shardings-after-maybe_update_params_sharding_with_opt.txt", "w") as f:
+      f.write(str(state_mesh_shardings))
+
   # pylint: disable=line-too-long
   (
       functional_train,
@@ -863,6 +868,8 @@ def train_loop(config, recorder, state=None):
       nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
       with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          # Apply sharding constraint to state to match expected sharding
+          state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
           state, metrics = p_train_step(state, example_batch, nextrng)
 
     step_time_delta = datetime.datetime.now() - last_step_completion
