@@ -55,8 +55,9 @@ export XLA_FLAGS="--xla_gpu_enable_latency_hiding_scheduler=true
                 --xla_gpu_enable_while_loop_double_buffering=false
                 --xla_gpu_enable_all_gather_combine_by_dim=false
                 --xla_gpu_enable_reduce_scatter_combine_by_dim=false
-                --xla_dump_hlo_as_text
-                --xla_dump_to=$HLO_DUMP_PATH
+                --xla_gpu_collective_permute_decomposer_threshold=0
+                --xla_gpu_enable_pipelined_collectives=false
+                --xla_gpu_experimental_pipeline_parallelism_opt_level=PIPELINE_PARALLELISM_OPT_LEVEL_ENABLE
                 --xla_disable_hlo_passes=rematerialization"
                 # --xla_gpu_collective_permute_decomposer_threshold=0
                 # --xla_gpu_enable_pipelined_collectives=false
