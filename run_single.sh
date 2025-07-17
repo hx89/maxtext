@@ -42,8 +42,7 @@ export XLA_FLAGS="--xla_gpu_enable_latency_hiding_scheduler=true
 echo "XLA_FLAGS = ${XLA_FLAGS}"
 echo "XLA_PYTHON_CLIENT_MEM_FRACTION = ${XLA_PYTHON_CLIENT_MEM_FRACTION}"
 
-RUN_SETTINGS="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_type=synthetic model_name=llama3.3-70b remat_policy='minimal' scan_layers=False attention='cudnn_flash_te' steps=20 dtype=bfloat16 max_target_length=8192 per_device_batch_size=1 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=nsys enable_checkpointing=false override_model_config=True base_num_decoder_layers=2 shard_optimizer_over_data=True"
-RUN_SETTINGS_XPLANE="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_type=synthetic model_name=llama3.3-70b remat_policy='minimal' scan_layers=False attention='cudnn_flash_te' steps=20 dtype=bfloat16 max_target_length=8192 per_device_batch_size=1 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=xplane enable_checkpointing=false override_model_config=True base_num_decoder_layers=2 shard_optimizer_over_data=True"
+RUN_SETTINGS="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_type=synthetic model_name=llama3.3-70b remat_policy='minimal' scan_layers=False attention='cudnn_flash_te' steps=20 dtype=bfloat16 max_target_length=8192 per_device_batch_size=1 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=nsys enable_checkpointing=false override_model_config=True base_num_decoder_layers=2 shard_optimizer_over_data=True gradient_accumulation_steps=4"
 
 echo "SLURM_PROCID is: $SLURM_PROCID"
 NSYS_OUTPUT_FILE="output-profile"
@@ -51,10 +50,11 @@ NSYS_OUTPUT_FILE="output-profile"
 NSYS_CMD="nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop"
 # NSYS_CMD=""
 
-# echo "Command: $NSYS_CMD python3 $RUN_SETTINGS"
-# ${NSYS_CMD} python3 ${RUN_SETTINGS}
+echo "Command: $NSYS_CMD python3 $RUN_SETTINGS"
+${NSYS_CMD} python3 ${RUN_SETTINGS}
 
-echo "Command: python3 $RUN_SETTINGS_XPLANE"
-python3 ${RUN_SETTINGS_XPLANE}
+# RUN_SETTINGS_XPLANE="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_type=synthetic model_name=llama3.3-70b remat_policy='minimal' scan_layers=False attention='cudnn_flash_te' steps=20 dtype=bfloat16 max_target_length=8192 per_device_batch_size=1 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=xplane enable_checkpointing=false override_model_config=True base_num_decoder_layers=2 shard_optimizer_over_data=True"
+# echo "Command: python3 $RUN_SETTINGS_XPLANE"
+# python3 ${RUN_SETTINGS_XPLANE}
 
 set +x
