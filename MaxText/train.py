@@ -337,7 +337,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
-def train_step(model, config, state_mesh_shardings, state, data, dropout_rng, params_shardings=None):
+def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng):
   """
 
   Args:
@@ -618,6 +618,7 @@ def train_loop(config, recorder, state=None):
 
   with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     shaped_batch = maxtext_utils.get_shaped_batch(config)
+    state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
     compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
     compiled_stats = compiled.memory_analysis()
     max_utils.print_compiled_memory_stats(compiled_stats)
