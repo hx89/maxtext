@@ -359,12 +359,22 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     extra_dpo_args = [reference_params]
     _loss_fn = dpo_loss_fn
 
+  params = state.params
+
+  def convert_to_bf16(param):
+  	if param.dtype == jnp.float32:
+  		return param.astype(jnp.bfloat16)
+  	return param
+  params_bf16 = jax.tree_util.tree_map(convert_to_bf16, params)
+  params_bf16 = jax.tree.map(jax.lax.with_sharding_constraint, params_bf16, params_shardings)
+
   if config.gradient_accumulation_steps > 1:
 
     def accumulate_gradient(acc_grad_and_loss, data):
+      params_bf16 = acc_grad_and_loss["params_bf16"]
       grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
       (_, aux), cur_batch_gradient = grad_func(
-          model, config, data, dropout_rng, state.params, *extra_dpo_args, is_train=True
+          model, config, data, dropout_rng, params_bf16, *extra_dpo_args, is_train=True
       )
       acc_grad_and_loss["loss"] += aux["total_loss"]
       acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
@@ -382,8 +392,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       return jnp.reshape(batch_arr, microbatch_shape)
 
     data = jax.tree_util.tree_map(reshape_to_microbatch_accumulations, data)
-    init_grad = jax.tree_util.tree_map(jnp.zeros_like, state.params)
-    init_grad_and_loss = {"loss": 0.0, "grad": init_grad, "total_weights": 0, "moe_lb_loss": 0.0, "mtp_loss": 0.0}
+    init_grad = jax.tree_util.tree_map(jnp.zeros_like, params_bf16)
+    init_grad = jax.tree.map(jax.lax.with_sharding_constraint, init_grad, params_shardings)
+    init_grad_and_loss = {"loss": 0.0, "grad": init_grad, "total_weights": 0, "moe_lb_loss": 0.0, "mtp_loss": 0.0, "params_bf16": params_bf16}
 
     grad_and_loss, aux = jax.lax.scan(
         accumulate_gradient, init_grad_and_loss, data, length=config.gradient_accumulation_steps
@@ -400,7 +411,6 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       if config.use_dpo:
         reference_params = jax.device_put(reference_params, max_utils.with_memory_kind(reference_params_sharding, "device"))
         extra_dpo_args = [reference_params]
-    params = state.params
     if config.shard_optimizer_over_data:
       params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
     grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
