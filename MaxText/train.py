@@ -404,7 +404,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         + grad_and_loss["moe_lb_loss"] / config.gradient_accumulation_steps
         + grad_and_loss["mtp_loss"] / config.gradient_accumulation_steps
     )
-    raw_grads = jax.tree_util.tree_map(lambda arr: arr / grad_and_loss["total_weights"], grad_and_loss["grad"])
+    raw_grads = grad_and_loss["grad"]
+    raw_grads = jax.tree.map(jax.lax.with_sharding_constraint, raw_grads, params_shardings)
+    raw_grads = jax.tree_util.tree_map(lambda arr: arr / grad_and_loss["total_weights"], raw_grads)
     aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)  # pytype: disable=module-attr
   else:
     if config.optimizer_memory_host_offload:
