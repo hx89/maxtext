@@ -307,6 +307,15 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   xent = xent * (data["targets_segmentation"] != 0)
   total_loss = jnp.sum(xent)
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
+
+  # If gradient accumulation is enabled, we don't need to divide total_loss 
+  # by total_weights and then multiply the computed gradient by total_weights,
+  # since it's equivalent to computing the gradient from total_loss.
+  # This simplification reduces the number of operations and makes it easier 
+  # for XLA to move all-reduce out of the gradient accumulation loop when use 
+  # Zero1+GA to reduce communication overhead.
+  # EPS was used to avoid division by zero, but it's not needed when gradient 
+  # accumulation is enabled since there's no division.
   if config.gradient_accumulation_steps > 1:
     loss = total_loss
   else:
