@@ -308,7 +308,10 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   total_loss = jnp.sum(xent)
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
   # loss = total_loss / (total_weights + EPS)
-  loss = total_loss
+  if config.gradient_accumulation_steps > 1:
+    loss = total_loss
+  else:
+    loss = total_loss / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
