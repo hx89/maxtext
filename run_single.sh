@@ -28,9 +28,9 @@ export XLA_FLAGS="--xla_gpu_enable_latency_hiding_scheduler=true
                 --xla_gpu_all_reduce_combine_threshold_bytes=$((BASE_THRESHOLD/AR_MULTIPLE))
                 --xla_gpu_all_gather_combine_threshold_bytes=$((BASE_THRESHOLD/AG_MULTIPLE))
                 --xla_gpu_reduce_scatter_combine_threshold_bytes=$((BASE_THRESHOLD/RS_MULTIPLE))
-                --xla_gpu_enable_pipelined_all_gather=true
-                --xla_gpu_enable_pipelined_reduce_scatter=true
-                --xla_gpu_enable_pipelined_all_reduce=true
+                --xla_gpu_enable_pipelined_all_gather=false
+                --xla_gpu_enable_pipelined_reduce_scatter=false
+                --xla_gpu_enable_pipelined_all_reduce=false
                 --xla_gpu_enable_while_loop_double_buffering=false
                 --xla_gpu_enable_all_gather_combine_by_dim=false
                 --xla_gpu_enable_reduce_scatter_combine_by_dim=false
@@ -47,7 +47,8 @@ echo "XLA_PYTHON_CLIENT_MEM_FRACTION = ${XLA_PYTHON_CLIENT_MEM_FRACTION}"
 
 # No GA
 # RUN_SETTINGS="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_type=synthetic model_name=llama3.3-70b remat_policy='minimal' scan_layers=False attention='cudnn_flash_jax' steps=20 dtype=bfloat16 max_target_length=8192 per_device_batch_size=1 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=nsys enable_checkpointing=false override_model_config=True base_num_decoder_layers=2 gradient_accumulation_steps=4 shard_optimizer_over_data=True"
-RUN_SETTINGS="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_type=synthetic model_name=llama3-8b remat_policy='minimal' scan_layers=False attention='cudnn_flash_jax' steps=10 dtype=bfloat16 max_target_length=8192 per_device_batch_size=2 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=nsys enable_checkpointing=false override_model_config=True gradient_accumulation_steps=8 profiler_steps=2 shard_optimizer_over_data=True base_num_decoder_layers=2"
+# RUN_SETTINGS="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_type=synthetic model_name=llama3-8b remat_policy='minimal' scan_layers=False attention='cudnn_flash_jax' steps=10 dtype=bfloat16 max_target_length=8192 per_device_batch_size=2 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=nsys enable_checkpointing=false override_model_config=True gradient_accumulation_steps=1 profiler_steps=2 shard_optimizer_over_data=False base_num_decoder_layers=2"
+RUN_SETTINGS="-m MaxText.train MaxText/configs/base.yml run_name=debug_run base_output_directory=./debug_logs hardware=gpu dataset_path=/data/c4/mlperf-tfrecord dataset_name=c4/en:3.1.0 model_name=llama3-8b remat_policy='minimal' scan_layers=False attention='cudnn_flash_jax' steps=10 dtype=bfloat16 max_target_length=8192 per_device_batch_size=2 ici_data_parallelism=${ici_DP} dcn_data_parallelism=${dcn_DP} ici_fsdp_parallelism=${ici_FSDP} dcn_fsdp_parallelism=${dcn_FSDP} profiler=nsys enable_checkpointing=false override_model_config=True gradient_accumulation_steps=4 profiler_steps=2 shard_optimizer_over_data=True"
 
 echo "SLURM_PROCID is: $SLURM_PROCID"
 NSYS_OUTPUT_FILE="output-profile"
