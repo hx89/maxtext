@@ -371,6 +371,25 @@ class Decoder(nn.Module):
             offload_src="device",
             offload_dst="pinned_host",
         )
+      elif cfg.remat_policy == "minimal_offloaded_with_context_and_quantization":
+        # offload all except context
+        policy = jax.checkpoint_policies.save_and_offload_only_these_names(
+            names_which_can_be_saved=["context"],
+            names_which_can_be_offloaded=[
+                "query_proj",
+                "value_proj",
+                "key_proj",
+                "qkv_proj",
+                "out_proj",
+                "mlpwi_0",
+                "mlpwi_1",
+                "mlpwi",
+                "mlpwo",
+                "quantization",
+            ],
+            offload_src="device",
+            offload_dst="pinned_host",
+        )
       elif cfg.remat_policy == "custom":
         policy = jax.checkpoint_policies.save_and_offload_only_these_names(
             names_which_can_be_saved=cfg.tensors_on_device,
