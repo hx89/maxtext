@@ -749,6 +749,7 @@ class TransformerEngineQuantization(Quantization):
         "te_fp8_currentscaling": recipe.Float8CurrentScaling,
         "te_mxfp8": recipe.MXFP8BlockScaling,
         "te_nvfp4": recipe.NVFP4BlockScaling,  # pytype: disable=module-attr
+        "te_nvfp4_no_rht": functools.partial(recipe.NVFP4BlockScaling, disable_rht=True),  # pytype: disable=module-attr
     }
     if recipe_name not in RECIPES:
       raise ValueError(f"Invalid TransformerEngine recipe: {recipe_name}")
@@ -804,7 +805,10 @@ class TransformerEngineQuantization(Quantization):
       def generate_quantizer_set(self, postfix: str = ""):
         OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
         return super().generate_quantizer_set(  # pytype: disable=wrong-keyword-args
-            postfix=postfix, variable_collection=OVERWRITE_WITH_GRADIENT, fp8_recipe=fp8_recipe
+            postfix=postfix,
+            variable_collection=OVERWRITE_WITH_GRADIENT, 
+            quantization_checkpoint_name="quantization",
+            fp8_recipe=fp8_recipe
         )
 
       @nn.compact

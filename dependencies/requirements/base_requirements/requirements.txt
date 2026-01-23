@@ -35,8 +35,8 @@ sentencepiece
 tensorboard-plugin-profile
 tensorboardx
 tensorflow-datasets
-tensorflow-text
-tensorflow
+tensorflow-text==2.18.1
+tensorflow==2.18.1
 tiktoken
 tokamax
 transformers
