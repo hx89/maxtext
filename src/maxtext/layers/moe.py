@@ -56,6 +56,199 @@ set_xla_metadata = xla_metadata.set_xla_metadata
 DISPATCH = "dispatch"
 COMBINE = "combine"
 
+# Debug flag for MoE permutation debugging
+# Set to True to enable detailed logging of intermediate values
+MOE_PERM_DEBUG = False
+
+# =============================================================================
+# Tensor Dumping for Multi-GPU Debugging
+# =============================================================================
+# jax.debug.print() has bugs on multiple GPUs. Use te_inspect_array instead,
+# which dumps tensors to binary files (my_tensor_gpuX.bin).
+#
+# Set MOE_DEBUG_DUMP_TENSOR to the name of the tensor you want to dump.
+# Available tensor names (matching _debug_log_array calls):
+#   - "after_te_permute_x", "after_mt_permute_x"
+#   - "after_ragged_all_to_all_fwd_x"
+#   - "after_te_local_permute_x", "after_mt_local_permute_x"
+#   - "after_gmm_intermediate_output"
+#   - "after_te_local_unpermute", "after_mt_local_unpermute"
+#   - "after_te_ragged_all_to_all_rev", "after_mt_ragged_all_to_all_rev"
+#   - "after_te_unpermute_output", "after_mt_unpermute_output"
+#
+# To load the dumped tensor:
+#   from transformer_engine.jax.inspect import load_array_dump
+#   data = load_array_dump("my_tensor_gpu0.bin", (batch, seq, dim), jnp.bfloat16)
+#
+# Note: Each call overwrites the same file, so only set ONE tensor name at a time.
+# =============================================================================
+MOE_DEBUG_DUMP_TENSOR = None  # e.g., "after_te_permute_x" or None to disable
+
+# Try to import te_inspect_array for multi-GPU debugging
+try:
+  from transformer_engine.jax.inspect import inspect_array as te_inspect_array
+  TE_INSPECT_AVAILABLE = True
+except ImportError:
+  TE_INSPECT_AVAILABLE = False
+  te_inspect_array = None
+
+# =============================================================================
+# Isolation Testing Knobs for MoE Permutation
+# =============================================================================
+# These allow mixing TE and MT implementations for debugging purposes.
+# When set to None, the behavior follows the config's use_te_permutation setting.
+# When set to "te" or "mt", it forces that implementation regardless of config.
+#
+# MOE_DEBUG_GLOBAL_PERM_MODE controls:
+#   - Global permute (te_permute vs permute) - token dispatch to experts
+#   - Global unpermute (te_unpermute vs unpermute) - token combine from experts
+#   - ragged_all_to_all parameter computation (TE vs MT method)
+#   - Buffer sizing for padding (TE alignment overhead)
+#
+# MOE_DEBUG_LOCAL_PERM_MODE controls:
+#   - Local permute (te_local_permute vs local_permute) - within-shard reordering
+#   - Local unpermute (te_local_unpermute vs MT argsort) - reverse within-shard reorder
+#
+# Example configurations:
+#   - Both None: Follow config.use_te_permutation for all operations
+#   - MOE_DEBUG_GLOBAL_PERM_MODE = "te", MOE_DEBUG_LOCAL_PERM_MODE = "mt":
+#       Uses TE for global permute/unpermute, MT for local permute/unpermute
+#   - MOE_DEBUG_GLOBAL_PERM_MODE = "mt", MOE_DEBUG_LOCAL_PERM_MODE = "te":
+#       Uses MT for global permute/unpermute, TE for local permute/unpermute
+#
+# Note: Mixing implementations may require compatible state. The global permute
+# produces state (e.g., te_row_id_map vs sorted_selected_experts) that must be
+# consistent with the unpermute operation used.
+# =============================================================================
+MOE_DEBUG_GLOBAL_PERM_MODE = None  # None, "te", or "mt"
+MOE_DEBUG_LOCAL_PERM_MODE = None   # None, "te", or "mt"
+
+
+def _get_effective_perm_mode(config_use_te: bool, debug_mode: str | None) -> bool:
+  """Determine effective permutation mode based on config and debug override.
+  
+  Args:
+    config_use_te: The config's use_te_permutation setting
+    debug_mode: Debug override - None, "te", or "mt"
+    
+  Returns:
+    True if TE implementation should be used, False for MT
+  """
+  if debug_mode is None:
+    return config_use_te
+  elif debug_mode == "te":
+    return True
+  elif debug_mode == "mt":
+    return False
+  else:
+    raise ValueError(f"Invalid debug_mode: {debug_mode}. Must be None, 'te', or 'mt'")
+
+def _debug_log_array(name: str, arr: jnp.ndarray, shard_id: int = 0):
+  """Log array statistics for debugging MoE permutation.
+  
+  When MOE_PERM_DEBUG is True, logs statistics using jax.debug.print.
+  Note: jax.debug.print has bugs on multi-GPU, use MOE_DEBUG_DUMP_TENSOR instead.
+  """
+  if not MOE_PERM_DEBUG:
+    return
+  
+  def _log_fn(name, arr, shard_id):
+    checksum = jnp.sum(arr.astype(jnp.float32))
+    mean_val = jnp.mean(arr.astype(jnp.float32))
+    max_val = jnp.max(arr.astype(jnp.float32))
+    min_val = jnp.min(arr.astype(jnp.float32))
+    jax.debug.print(
+        "[MOE_DEBUG] shard={shard_id} {name}: shape={shape}, dtype={dtype}, "
+        "sum={checksum:.4f}, mean={mean:.4f}, min={min_val:.4f}, max={max_val:.4f}",
+        shard_id=shard_id,
+        name=name,
+        shape=arr.shape,
+        dtype=arr.dtype,
+        checksum=checksum,
+        mean=mean_val,
+        min_val=min_val,
+        max_val=max_val,
+    )
+  
+  _log_fn(name, arr, shard_id)
+
+
+def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
+  """Dump array to file for multi-GPU debugging using te_inspect_array.
+  
+  This is a workaround for jax.debug.print() bugs on multiple GPUs.
+  The array is dumped to my_tensor_gpuX.bin where X is the GPU ID.
+  
+  IMPORTANT: You must re-assign the return value to ensure XLA doesn't optimize out the call.
+  Example: arr = _debug_dump_array("my_tensor", arr)
+  
+  Args:
+    name: Name of the tensor (for matching against MOE_DEBUG_DUMP_TENSOR)
+    arr: The array to potentially dump
+    
+  Returns:
+    The array (possibly passed through te_inspect_array)
+  """
+  if MOE_DEBUG_DUMP_TENSOR is None or MOE_DEBUG_DUMP_TENSOR != name:
+    return arr
+  
+  if not TE_INSPECT_AVAILABLE:
+    print(f"[MOE_DEBUG] Warning: te_inspect_array not available, cannot dump {name}")
+    return arr
+  
+  # Use te_inspect_array to dump the tensor to file
+  # Must re-assign to prevent XLA from optimizing out the call
+  return te_inspect_array(arr, name)
+
+
+def _debug_log_sizes(name: str, arr: jnp.ndarray, shard_id: int = 0):
+  """Log size/count arrays (like group_sizes, send_sizes) for debugging."""
+  if not MOE_PERM_DEBUG:
+    return
+  
+  jax.debug.print(
+      "[MOE_DEBUG] shard={shard_id} {name}: {arr}",
+      shard_id=shard_id,
+      name=name,
+      arr=arr,
+  )
+
+
+def _debug_grad_hook(name: str, shard_id: int = 0):
+  """Create a gradient logging hook for debugging backward pass.
+  
+  Usage: x = _debug_grad_hook("my_var", shard_id)(x)
+  This logs the gradient norm during the backward pass.
+  """
+  if not MOE_PERM_DEBUG:
+    return lambda x: x
+  
+  @jax.custom_vjp
+  def identity_with_grad_log(x):
+    return x
+  
+  def fwd(x):
+    return x, None
+  
+  def bwd(_, g):
+    grad_norm = jnp.sqrt(jnp.sum(g.astype(jnp.float32) ** 2))
+    grad_sum = jnp.sum(g.astype(jnp.float32))
+    grad_max = jnp.max(jnp.abs(g.astype(jnp.float32)))
+    jax.debug.print(
+        "[MOE_GRAD_DEBUG] shard={shard_id} {name}_grad: shape={shape}, "
+        "norm={norm:.6f}, sum={grad_sum:.6f}, max_abs={max_abs:.6f}",
+        shard_id=shard_id,
+        name=name,
+        shape=g.shape,
+        norm=grad_norm,
+        grad_sum=grad_sum,
+        max_abs=grad_max,
+    )
+    return (g,)
+  
+  identity_with_grad_log.defvjp(fwd, bwd)
+  return identity_with_grad_log
+
 
 @struct.dataclass
 class RouteMetadata:
@@ -1296,12 +1489,19 @@ class RoutedMoE(nnx.Module):
         sorted_expert_ids: Local expert ID for each token.
     """
     local_expert_start = shard_index * local_expert_size
-    local_expert_end = local_expert_start + local_expert_size
+
+    # Use dynamic_slice since shard_index may be a traced value (from jax.lax.axis_index)
+    # Extract columns [local_expert_start : local_expert_start + local_expert_size]
+    local_expert_columns = jax.lax.dynamic_slice(
+        all_shards_tokens_per_expert,
+        start_indices=(0, local_expert_start),
+        slice_sizes=(num_expert_shards, local_expert_size)
+    )
 
     # Compute split sizes for chunk sort
     # After ragged_all_to_all, data is ordered by source shard, then by expert within each shard
     # split_sizes: token counts for each (shard, local_expert) pair
-    split_sizes = all_shards_tokens_per_expert[:, local_expert_start:local_expert_end].reshape(-1)
+    split_sizes = local_expert_columns.reshape(-1)
 
     # Create sort indices to reorder from (shard, expert) to (expert, shard)
     # Original: [(s0,e0), (s0,e1), ..., (s1,e0), (s1,e1), ...]
@@ -1317,10 +1517,7 @@ class RoutedMoE(nnx.Module):
     )
 
     # Compute local group sizes (sum across source shards per local expert)
-    local_group_sizes = jnp.sum(
-        all_shards_tokens_per_expert[:, local_expert_start:local_expert_end],
-        axis=0,
-    )
+    local_group_sizes = jnp.sum(local_expert_columns, axis=0)
 
     # Create sorted expert IDs for each token
     sorted_expert_ids = jnp.repeat(
@@ -1329,56 +1526,47 @@ class RoutedMoE(nnx.Module):
         total_repeat_length=inputs.shape[0],
     )
 
+    # Compute the reordered split_sizes after sorting (expert, shard order)
+    # and the inverse permutation for te_local_unpermute
+    # The sorted split_sizes follow the sorted_chunk_indices order
+    sorted_split_sizes = split_sizes[sorted_chunk_indices]
+
+    # Inverse permutation: argsort gives us how to reverse the sort
+    inverse_chunk_indices = jnp.argsort(sorted_chunk_indices)
+
     return (
         sorted_inputs,
         sort_map,
         local_group_sizes,
         sorted_expert_ids,
+        sorted_split_sizes,
+        inverse_chunk_indices,
     )
 
   @staticmethod
   def te_local_unpermute(
       outputs,
-      sort_map,
-      all_shards_tokens_per_expert,
-      local_expert_size,
-      shard_index,
-      num_expert_shards,
+      sorted_split_sizes,
+      inverse_chunk_indices,
   ):
     """TE-based reverse of local permutation.
 
-    Reverses the chunk sort done by te_local_permute.
+    Reverses the chunk sort done by te_local_permute using TE's sort_chunks_by_index
+    with the inverse permutation. This ensures proper gradient flow through the
+    differentiable TE primitive.
 
     Args:
       outputs: Expert outputs grouped by local expert [total_tokens, hidden].
-      sort_map: Sort map from te_local_permute.
-      all_shards_tokens_per_expert: Token counts from all shards [num_shards, num_experts].
-      local_expert_size: Number of local experts per shard.
-      shard_index: Current shard index.
-      num_expert_shards: Number of expert-parallel shards.
+      sorted_split_sizes: Split sizes in (expert, shard) order from te_local_permute.
+      inverse_chunk_indices: Inverse permutation to reverse the sort.
 
     Returns:
       Unsorted outputs ready for reverse ragged_all_to_all.
     """
-    local_expert_start = shard_index * local_expert_size
-    local_expert_end = local_expert_start + local_expert_size
-
-    # Compute group sizes per local expert
-    local_group_sizes = jnp.sum(
-        all_shards_tokens_per_expert[:, local_expert_start:local_expert_end],
-        axis=0,
-    )
-
-    # Compute inverse sort indices
-    indices_matrix = jnp.arange(num_expert_shards * local_expert_size).reshape(
-        num_expert_shards, local_expert_size
-    )
-    sorted_chunk_indices = indices_matrix.T.reshape(-1)
-    reverse_indices = jnp.argsort(sorted_chunk_indices)
-
-    # Use TE sort_chunks_by_index with inverse indices
+    # Use TE's sort_chunks_by_index with the inverse permutation
+    # This is fully differentiable (has proper VJP rules)
     unsorted_outputs, _ = te_permutation.te_sort_chunks_by_expert(
-        outputs, local_group_sizes, reverse_indices
+        outputs, sorted_split_sizes, inverse_chunk_indices
     )
 
     return unsorted_outputs
@@ -1585,7 +1773,7 @@ class RoutedMoE(nnx.Module):
 
     def get_quantization_dtypes():
       lhs_quantize_dtype, rhs_quantize_dtype = None, None
-      if self.quant is not None:
+      if self.quant is not None and hasattr(self.quant, 'quant_dg'):
         quant_dg = self.quant.quant_dg
         lhs_quantize_dtype = quant_dg.fwd.dg_quantizer.lhs.numerics.get_dtype()
         rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
