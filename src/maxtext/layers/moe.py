@@ -1114,6 +1114,7 @@ class RoutedMoE(nnx.Module):
       jax.Array,
       jax.Array,
       jax.Array,
+      jax.Array,
       Optional[jax.Array],
       Optional[jax.Array],
       jax.Array,
@@ -1135,7 +1136,8 @@ class RoutedMoE(nnx.Module):
         - permuted_inputs: Tokens sorted by expert [num_out_tokens, hidden].
         - row_id_map: Mapping for unpermute phase.
         - weights: Routing weights [batch, seq, num_experts_per_tok].
-        - tokens_per_expert: Token counts per expert [num_experts].
+        - tokens_per_expert: Padded token counts per expert [num_experts] (aligned to align_size).
+        - original_tokens_per_expert: Unpadded token counts [num_experts] for mixed mode.
         - top_k_indices: Selected expert indices [batch, seq, num_experts_per_tok].
         - lb_loss: Load balance loss (or None).
         - bias_updates: Bias updates (or None).
@@ -1196,6 +1198,11 @@ class RoutedMoE(nnx.Module):
     if align_size == 0:
       align_size = None
 
+    # Compute original (unpadded) token counts from routing_map BEFORE dispatch
+    # This is needed for mixed mode (TE global + MT local) where MT expects unpadded counts.
+    # Shape: [num_experts] - actual number of tokens routed to each expert
+    original_tokens_per_expert = jnp.sum(routing_map, axis=0).astype(jnp.int32)
+
     # Call TE token dispatch with probs and padding
     # Note: We pass dense_probs to dispatch (for permuting alongside tokens),
     # and also return it for use as merging_probs in te_unpermute (combine).
@@ -1211,7 +1218,8 @@ class RoutedMoE(nnx.Module):
         permuted_outputs,
         row_id_map,
         weights,
-        tokens_per_expert,
+        tokens_per_expert,  # Padded counts (aligned to align_size)
+        original_tokens_per_expert,  # Unpadded counts for mixed mode
         top_k_indices,
         lb_loss,
         bias_updates,
@@ -1449,8 +1457,14 @@ class RoutedMoE(nnx.Module):
     (source_shard, expert) ordering to (expert, source_shard) ordering,
     which groups all tokens for each local expert contiguously.
 
+    IMPORTANT: The TE kernel has a limitation - it expects inputs.shape[0] to
+    equal sum(split_sizes). When the input buffer is larger (common after
+    ragged_all_to_all), the kernel produces garbage for positions beyond
+    sum(split_sizes). This function applies a mask to zero out the garbage.
+
     Args:
-      inputs: Tokens received from ragged_all_to_all [total_recv_tokens, hidden].
+      inputs: Tokens received from ragged_all_to_all [buffer_size, hidden].
+              buffer_size may be larger than actual token count.
       all_shards_tokens_per_expert: Token counts from all shards [num_shards, num_experts].
       local_expert_size: Number of local experts per shard.
       shard_index: Current shard index.
@@ -1458,10 +1472,12 @@ class RoutedMoE(nnx.Module):
 
     Returns:
       A tuple containing:
-        sorted_inputs: Tokens grouped by local expert.
+        sorted_inputs: Tokens grouped by local expert [buffer_size, hidden].
         sort_map: Map for reversing the sort.
         local_group_sizes: Token counts per local expert [local_expert_size].
         sorted_expert_ids: Local expert ID for each token.
+        sorted_split_sizes: Split sizes in sorted order.
+        inverse_chunk_indices: Inverse permutation for unpermute.
     """
     local_expert_start = shard_index * local_expert_size
 
@@ -1478,6 +1494,11 @@ class RoutedMoE(nnx.Module):
     # split_sizes: token counts for each (shard, local_expert) pair
     split_sizes = local_expert_columns.reshape(-1)
 
+    # Compute the actual token count (sum of split_sizes)
+    # This is used to mask out garbage produced by the kernel for buffer positions
+    # beyond the valid token range.
+    actual_token_count = jnp.sum(split_sizes)
+
     # Create sort indices to reorder from (shard, expert) to (expert, shard)
     # Original: [(s0,e0), (s0,e1), ..., (s1,e0), (s1,e1), ...]
     # Target: [(s0,e0), (s1,e0), ..., (s0,e1), (s1,e1), ...]
@@ -1487,14 +1508,23 @@ class RoutedMoE(nnx.Module):
     sorted_chunk_indices = indices_matrix.T.reshape(-1)
 
     # Use TE sort_chunks_by_index
-    sorted_inputs, sort_map = te_permutation.te_sort_chunks_by_expert(
+    # NOTE: The kernel produces garbage for positions >= sum(split_sizes)
+    # because it assumes inputs.shape[0] == sum(split_sizes).
+    sorted_inputs_raw, sort_map = te_permutation.te_sort_chunks_by_expert(
         inputs, split_sizes, sorted_chunk_indices
     )
+
+    # CRITICAL FIX: Mask out garbage data beyond the valid token range.
+    # The kernel produces garbage for buffer positions >= actual_token_count.
+    # We create a mask to zero out these positions.
+    valid_mask = jnp.arange(inputs.shape[0]) < actual_token_count
+    sorted_inputs = jnp.where(valid_mask[:, None], sorted_inputs_raw, 0)
 
     # Compute local group sizes (sum across source shards per local expert)
     local_group_sizes = jnp.sum(local_expert_columns, axis=0)
 
     # Create sorted expert IDs for each token
+    # Use actual_token_count for repeat length, not inputs.shape[0]
     sorted_expert_ids = jnp.repeat(
         jnp.arange(local_expert_size),
         repeats=local_group_sizes,
