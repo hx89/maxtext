@@ -88,8 +88,8 @@ MOE_PERM_DEBUG = False  # WARNING: Only works on single GPU!
 # Note: Each call overwrites the same file, so only set ONE tensor name at a time.
 # Set MOE_DEBUG_DUMP_ONCE=True to only dump on the first call (avoids backward pass overwriting).
 # =============================================================================
-MOE_DEBUG_DUMP_TENSOR = None  # e.g., "after_te_permute_x" or None to disable
-MOE_DEBUG_DUMP_ONCE = True    # If True, only dump on first call (forward pass)
+MOE_DEBUG_DUMP_TENSOR = None
+MOE_DEBUG_DUMP_ONCE = False    # If True, only dump on first call (forward pass)
 
 # Try to import te_inspect_array for multi-GPU debugging
 try:
@@ -98,6 +98,9 @@ try:
 except ImportError:
   TE_INSPECT_AVAILABLE = False
   te_inspect_array = None
+
+# DEBUG: Print import status and dump settings at module load time (comment out after debugging)
+print(f"[MOE DEBUG] TE_INSPECT_AVAILABLE = {TE_INSPECT_AVAILABLE}, MOE_DEBUG_DUMP_TENSOR = {MOE_DEBUG_DUMP_TENSOR}")
 
 # =============================================================================
 # Isolation Testing Knobs for MoE Permutation
@@ -125,8 +128,8 @@ except ImportError:
 #   - MOE_DEBUG_GLOBAL_PERM_MODE = "mt", MOE_DEBUG_LOCAL_PERM_MODE = "te":
 #       Test if local TE permute is the issue vs global MT permute
 # =============================================================================
-MOE_DEBUG_GLOBAL_PERM_MODE = None  # None, "te", or "mt"
-MOE_DEBUG_LOCAL_PERM_MODE = None   # None, "te", or "mt"
+MOE_DEBUG_GLOBAL_PERM_MODE = "te"
+MOE_DEBUG_LOCAL_PERM_MODE = "te"
 
 
 def _get_effective_perm_mode(config_use_te: bool, debug_mode: str | None) -> bool:
@@ -199,6 +202,9 @@ def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
   # Mark as called
   _debug_dump_already_called.add(name)
   
+  # DEBUG: Print that we're about to dump (this runs at trace time, not runtime)
+  print(f"[MOE_DEBUG] Calling te_inspect_array for '{name}', shape={arr.shape}, dtype={arr.dtype}")
+
   # Use te_inspect_array to dump the tensor to file
   # Must re-assign to prevent XLA from optimizing out the call
   return te_inspect_array(arr, name)
@@ -3434,3 +3440,4 @@ def get_routed_and_shared_moe(
       abstract_init=False,
   )
   return module
+
