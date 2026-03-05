@@ -840,9 +840,7 @@ class RoutedMoE(nnx.Module):
       )
 
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
-      # weights will be of shape (batch_size, seq_len, num_experts_per_tok)
-      router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))  # weights are top_k_weights here
-      # Squeeze router_scores to (batch_size * seq_len, num_experts_per_tok)
+      router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))
       inputs_2d = inputs_2d * router_scores.reshape(bsz_times_seq_len, -1)
 
     num_expert_parallelism = self.get_expert_parallelism_size()
@@ -1039,13 +1037,10 @@ class RoutedMoE(nnx.Module):
     """Permute tokens to group by expert. Dispatches to TE or MT implementation.
 
     Returns:
-      Tuple of (x, perm_state, group_sizes, selected_experts, lb_loss, bias_updates).
-      - x: Permuted tokens [num_out_tokens, hidden].
-      - perm_state: PermState carrying implementation-specific state for unpermute.
-      - group_sizes: Token counts per expert [num_experts].
-      - selected_experts: Expert ID for each token position [num_out_tokens].
-      - lb_loss: Load balance loss (or None).
-      - bias_updates: Bias updates (or None).
+      routing_map: Boolean routing mask [num_tokens, num_experts].
+      dense_probs: Sparse probs as dense [num_tokens, num_experts] for TE combine.
+      lb_loss: Scalar load balance loss or None.
+      bias_updates: Bias update direction [num_experts] or None.
     """
     use_te = self.config.te_router_and_permutation_impl
     perm_state = PermState(use_te)
