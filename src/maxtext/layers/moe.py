@@ -2078,6 +2078,7 @@ class RoutedMoE(nnx.Module):
                 use_custom_sort_vjp=self.config.use_custom_sort_vjp,
                 use_ragged_sort=self.config.use_ragged_sort,
             )
+
           else:
             x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
                 x,
