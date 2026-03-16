@@ -839,6 +839,19 @@ class RoutedMoE(nnx.Module):
           selected_experts, self.config.num_experts, self.config.routed_bias_update_rate
       )
 
+    weights, selected_experts = self.get_topk(gate_logits, pre_bias_logits, rngs)
+
+    lb_loss = None
+    if self.config.load_balance_loss_weight > 0.0:
+      softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+      lb_loss = self.load_balance_loss(selected_experts, softmax_probs)
+
+    bias_updates = None
+    if self.should_update_load_balance():
+      bias_updates = calculate_load_balance_updates(
+          selected_experts, self.config.num_experts, self.config.routed_bias_update_rate
+      )
+
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
       router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))
       inputs_2d = inputs_2d * router_scores.reshape(bsz_times_seq_len, -1)

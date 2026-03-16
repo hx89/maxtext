@@ -835,10 +835,6 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use TransformerEngine Grouped GEMM kernels for matmuls in MoE layers.",
   )
-  te_router_impl: bool = Field(
-      False,
-      description="Whether to use TransformerEngine fused router kernels for MoE routing. Requires te_permutation_impl=True.",
-  )
   use_random_routing: bool = Field(False, description="Whether to use random routing for debugging.")
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
