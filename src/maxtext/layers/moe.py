@@ -1184,10 +1184,11 @@ class RoutedMoE(nnx.Module):
       - lb_loss: Load balance loss (or None).
       - bias_updates: Bias updates (or None).
     """
-    use_te = getattr(self.config, "te_permutation_impl", False) and te_permutation.TE_PERMUTATION_AVAILABLE
+    use_te = getattr(self.config, "te_permutation_impl", False)
     perm_state = PermState(use_te)
 
     if use_te:
+      assert te_permutation.TE_PERMUTATION_AVAILABLE, "TE permutation implementation not available, please ensure triton is installed"
       # TE permutation path
       (
           x, perm_state.row_id_map, weights, group_sizes, top_k_indices,
