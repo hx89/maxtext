@@ -853,7 +853,9 @@ class RoutedMoE(nnx.Module):
       )
 
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
-      router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))
+      # weights will be of shape (batch_size, seq_len, num_experts_per_tok)
+      router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))  # weights are top_k_weights here
+      # Squeeze router_scores to (batch_size * seq_len, num_experts_per_tok)
       inputs_2d = inputs_2d * router_scores.reshape(bsz_times_seq_len, -1)
 
     num_expert_parallelism = self.get_expert_parallelism_size()
