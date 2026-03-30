@@ -342,6 +342,10 @@ class GateLogit(nnx.Module):
         _initializing,
         out_sharding=output_sharding,
     )
+
+    if return_raw_logits:
+      return output, None
+
     pre_bias_logits = None
 
     if self.score_func:
@@ -829,12 +833,11 @@ class RoutedMoE(nnx.Module):
       softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
       lb_loss = self.load_balance_loss(selected_experts, softmax_probs)
 
+    bias_updates = None
     if self.should_update_load_balance():
       bias_updates = calculate_load_balance_updates(
           selected_experts, self.config.num_experts, self.config.routed_bias_update_rate
       )
-    else:
-      bias_updates = None
 
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
       # weights will be of shape (batch_size, seq_len, num_experts_per_tok)
@@ -934,183 +937,42 @@ class RoutedMoE(nnx.Module):
         local_group_size,
     )
 
-  def _te_permute(
-      self,
-      inputs: jax.Array,
-      gate_logits: jax.Array,
-      pre_bias_logits: Optional[jax.Array],
-      rngs=None,
-      roll_to_expert_id=None,
-  ) -> Tuple[
-      jax.Array,
-      jax.Array,
-      jax.Array,
-      jax.Array,
-      jax.Array,
-      jax.Array,
-      Optional[jax.Array],
-      Optional[jax.Array],
-      jax.Array,
-      Optional[jax.Array],
-  ]:
-    """Permute tokens to group by expert using TransformerEngine kernels.
-
-    This is an alternative to the standard permute() method that uses TE's
-    optimized Triton kernels for token dispatch.
-
-    Args:
-      inputs: Input tensor of shape [batch, seq, hidden].
-      gate_logits: Router logits of shape [batch, seq, num_experts].
-      pre_bias_logits: Pre-bias logits for DeepSeek models, or None.
-      rngs: Random number generators for dropout (if any).
-
-    Returns:
-      Tuple of:
-        - permuted_inputs: Tokens sorted by expert [num_out_tokens, hidden].
-        - row_id_map: Mapping for unpermute phase.
-        - weights: Routing weights [batch, seq, num_experts_per_tok].
-        - tokens_per_expert: Token counts per expert [num_experts] (aligned if padding enabled).
-        - top_k_indices: Selected expert indices [batch, seq, num_experts_per_tok].
-        - lb_loss: Load balance loss (or None).
-        - bias_updates: Bias updates (or None).
-        - dense_probs: Dense routing probs [num_tokens, num_experts] for combine.
-        - pad_offsets: Padding offsets per expert [num_experts] (or None).
-
-    Note on probs flow:
-      - weights from get_topk() are already softmaxed over the top-k experts
-      - We convert to dense_probs [num_tokens, num_experts] once here
-      - TE token_combine uses dense_probs directly as merging_probs (no further softmax)
-      - This avoids redundant computation of dense_probs in te_unpermute()
-    """
-    te_permutation.check_te_permutation_available()
-
-    inputs_shape = inputs.shape
-    batch_size = inputs_shape[0]
-    seq_len = inputs_shape[1]
-    hidden_size = inputs_shape[2]
-    num_tokens = batch_size * seq_len
-
-    # Get top-k routing decisions
-    # Note: weights are already softmaxed over the k selected experts in get_topk()
-    weights, top_k_indices = self.get_topk(gate_logits, pre_bias_logits, rngs)
-
-    # Compute load balance loss if configured
-    lb_loss = None
-    if self.config.load_balance_loss_weight > 0.0:
-      softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
-      lb_loss = self.load_balance_loss(top_k_indices, softmax_probs)
-
-    # Compute bias updates if needed
-    if self.should_update_load_balance():
-      bias_updates = calculate_load_balance_updates(
-          top_k_indices, self.config.num_experts, self.config.routed_bias_update_rate
-      )
-    else:
-      bias_updates = None
-
-    # For ring-of-experts: shift expert indices so each shard's local experts
-    # become 0..local_expert_size-1 (same as MT's roll logic)
-    if roll_to_expert_id is not None:
-      top_k_indices = (top_k_indices - roll_to_expert_id) % self.num_experts
-
-    # Convert indices to routing map (binary mask)
-    routing_map = te_permutation.create_routing_map_from_indices(
-        top_k_indices, self.num_experts
-    )
-
-    # Create dense probs from top-k weights for TE dispatch AND combine
-    # Shape: [num_tokens, num_experts] where probs[i, j] is the routing prob
-    # for token i to expert j (0 for non-selected experts)
-    # These are already normalized (softmax over top-k in get_topk), so TE
-    # can use them directly as merging_probs without further processing.
-    dense_probs = te_permutation.create_dense_probs_from_topk(
-        weights, top_k_indices, self.num_experts
-    )
-
-    # Number of output tokens
-    num_out_tokens = num_tokens * self.num_experts_per_tok
-
-    # Get align_size from config (0 means no padding)
-    align_size = self.config.te_permutation_align_size
-    if align_size == 0:
-      align_size = None
-
-    # Call TE token dispatch with probs and padding
-    # Note: We pass dense_probs to dispatch (for permuting alongside tokens),
-    # and also return it for use as merging_probs in te_unpermute (combine).
-    permuted_outputs, _permuted_probs, row_id_map, pad_offsets, tokens_per_expert = te_permutation.te_token_dispatch(
-        inputs.reshape(-1, hidden_size),
-        routing_map,
-        num_out_tokens=num_out_tokens,
-        probs=dense_probs,
-        align_size=align_size,
-    )
-
-    return (
-        permuted_outputs,
-        row_id_map,
-        weights,
-        tokens_per_expert,  # Token counts per expert (aligned to align_size if padding enabled)
-        top_k_indices,
-        lb_loss,
-        bias_updates,
-        dense_probs,  # Return dense_probs for reuse in te_unpermute
-        pad_offsets,
+  def _te_permute(self, inputs, gate_logits, gate_expert_bias, rngs=None, roll_to_expert_id=None):
+    """TE routing + permutation. Delegates to te_permutation.te_permute()."""
+    return te_permutation.te_permute(
+        inputs,
+        gate_logits,
+        gate_expert_bias,
+        num_experts=self.num_experts,
+        num_experts_per_tok=self.num_experts_per_tok,
+        dtype=self.dtype,
+        logits_dot_in_fp32=self.config.logits_dot_in_fp32,
+        routed_score_func=self.config.routed_score_func,
+        n_routing_groups=self.config.n_routing_groups,
+        topk_routing_group=self.config.topk_routing_group,
+        routed_scaling_factor=self.config.routed_scaling_factor,
+        load_balance_loss_weight=self.config.load_balance_loss_weight,
+        should_update_load_balance=self.should_update_load_balance(),
+        routed_bias_update_rate=self.config.routed_bias_update_rate,
+        te_permutation_align_size=self.config.te_permutation_align_size,
+        roll_to_expert_id=roll_to_expert_id,
     )
 
   def _te_unpermute(
-      self,
-      expert_outputs: jax.Array,
-      row_id_map: jax.Array,
-      batch_size: int,
-      sequence_length: int,
-      dense_probs: Optional[jax.Array] = None,
-      pad_offsets: Optional[jax.Array] = None,
-  ) -> jax.Array:
-    """Unpermute expert outputs using TransformerEngine kernels.
-
-    Args:
-      expert_outputs: Output from grouped GEMM [num_out_tokens, hidden].
-      row_id_map: Row ID map from te_permute.
-      batch_size: Original batch size.
-      sequence_length: Original sequence length.
-      dense_probs: Dense routing probs [num_tokens, num_experts] from te_permute.
-                   Used as merging_probs for weighted combination.
-                   Already softmaxed over top-k experts in get_topk().
-      pad_offsets: Padding offsets per expert from te_permute (for unpadding).
-
-    Returns:
-      Combined output tensor [batch, seq, hidden].
-
-    Note on probs:
-      TE's token_combine directly multiplies each expert's contribution by
-      merging_probs[token_id, expert_id]. Since dense_probs is already
-      normalized (softmax over top-k in get_topk), no further processing needed.
-      For LLAMA4, we pass None (uses weight of 1 for each expert).
-    """
-    te_permutation.check_te_permutation_available()
-
-    hidden_size = expert_outputs.shape[-1]
-
-    # Prepare merging probabilities for weighted combination
-    # dense_probs is precomputed in te_permute() to avoid redundant computation
-    merging_probs = None
-    if self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4:
-      merging_probs = dense_probs
-      # For LLAMA4, we don't use weighted combination (implicit weights of 1)
-
-    # Call TE token combine with proper merging probs and padding offsets
-    output = te_permutation.te_token_combine(
+      self, expert_outputs, row_id_map, batch_size, sequence_length,
+      dense_probs=None, pad_offsets=None,
+  ):
+    """Unpermute expert outputs. Delegates to te_permutation.te_unpermute()."""
+    return te_permutation.te_unpermute(
         expert_outputs,
         row_id_map,
-        merging_probs=merging_probs,
+        batch_size,
+        sequence_length,
+        dtype=self.dtype,
+        is_llama4=(self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4),
+        dense_probs=dense_probs,
         pad_offsets=pad_offsets,
     )
-
-    # Reshape back to [batch, seq, hidden]
-    output = output.reshape(batch_size, sequence_length, hidden_size)
-
-    return output.astype(self.dtype)
 
   def _mt_unpermute(
       self,
@@ -1172,7 +1034,8 @@ class RoutedMoE(nnx.Module):
         )
     return output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
 
-  def permute(self, inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp=True, rngs=None, roll_to_expert_id=None):
+  def permute(self, inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp=True, rngs=None,
+              roll_to_expert_id=None, gate_expert_bias=None):
     """Permute tokens to group by expert. Dispatches to TE or MT implementation.
 
     Returns:
@@ -1184,26 +1047,25 @@ class RoutedMoE(nnx.Module):
       - lb_loss: Load balance loss (or None).
       - bias_updates: Bias updates (or None).
     """
-    use_te = getattr(self.config, "te_permutation_impl", False)
+    use_te = self.config.te_router_and_permutation_impl
     perm_state = PermState(use_te)
 
     if use_te:
-      assert te_permutation.TE_PERMUTATION_AVAILABLE, "TE permutation implementation not available, please ensure triton is installed"
-      # TE permutation path
-      (
-          x, perm_state.row_id_map, weights, group_sizes, top_k_indices,
-          lb_loss, bias_updates, perm_state.dense_probs, perm_state.pad_offsets,
-      ) = self._te_permute(inputs, gate_logits, pre_bias_logits, rngs, roll_to_expert_id)
-      # Create selected_experts for bias transform and GMM
+      (x, perm_state.row_id_map, group_sizes, lb_loss, bias_updates,
+       perm_state.dense_probs, perm_state.pad_offsets) = self._te_permute(
+          inputs, gate_logits, gate_expert_bias, rngs, roll_to_expert_id,
+      )
+
       expert_indices = jnp.arange(self.num_experts)
       selected_experts = jnp.repeat(
           expert_indices, repeats=group_sizes, total_repeat_length=x.shape[0],
       )
-      perm_state.weights = weights
+      perm_state.weights = None
+
     else:
-      # MT permutation path
-      x, perm_state.sorted_selected_experts, perm_state.weights, group_sizes, selected_experts, lb_loss, bias_updates = (
-          self._mt_permute(inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp, rngs, roll_to_expert_id)
+      (x, perm_state.sorted_selected_experts, perm_state.weights, group_sizes,
+       selected_experts, lb_loss, bias_updates) = self._mt_permute(
+          inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp, rngs, roll_to_expert_id,
       )
 
     return x, perm_state, group_sizes, selected_experts, lb_loss, bias_updates
@@ -2297,6 +2159,7 @@ class RoutedMoE(nnx.Module):
             wo_bias_pspec,
             decoder_tokens_pspec,
             P(),  # Replicate the input key
+            P(),  # gate_expert_bias (replicated)
         ),
         out_specs=(
             self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
