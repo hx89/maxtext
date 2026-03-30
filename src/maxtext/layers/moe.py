@@ -1382,9 +1382,11 @@ class RoutedMoE(nnx.Module):
       if use_te_gmm:
             assert not self.config.megablox and not self.config.use_tokamax_gmm, "TE GMM is only supported when Megablox and Tokamax GMM are disabled."
             assert self.config.quantization and self.config.quantization.startswith("te_"), "TE GMM currently requires TE quantization."
-            # TODO(jberchtold): Adjust this based on TE GMM requirements per recipe
-            TE_GMM_ALIGN_REQUIREMENT = 128
-            assert self.config.te_permutation_impl and self.config.te_permutation_align_size % TE_GMM_ALIGN_REQUIREMENT == 0 and self.config.te_permutation_align_size > 0, f"TE GMM currently requires TE permutation with alignment (te_permutation_align_size > 0 and multiple of {TE_GMM_ALIGN_REQUIREMENT})."
+            import os
+            if int(os.getenv("MAXTEXT_NVTE_UNSAFE_GROUPED_GEMM_USAGE_WITHOUT_TE_PERMUTE", "0")) == 0:
+              # TODO(jberchtold): Adjust this based on TE GMM requirements per recipe
+              TE_GMM_ALIGN_REQUIREMENT = 128
+              assert self.config.te_permutation_impl and self.config.te_permutation_align_size % TE_GMM_ALIGN_REQUIREMENT == 0 and self.config.te_permutation_align_size > 0, f"TE GMM currently requires TE permutation with alignment (te_permutation_align_size > 0 and multiple of {TE_GMM_ALIGN_REQUIREMENT})."
             return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
 
       pad_length = self.config.wi_tile_fwd_batch_seq
