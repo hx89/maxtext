@@ -842,6 +842,28 @@ class RoutedMoE(nnx.Module):
 
     weights, selected_experts = self.get_topk(gate_logits, pre_bias_logits, rngs)
 
+    token_count_per_expert = jnp.bincount(selected_experts.ravel(), length=self.num_experts)
+    padding_tokens_required_per_expert = self.config.te_permutation_align_size - (token_count_per_expert % self.config.te_permutation_align_size)
+    # Build a static-size padding index buffer.
+    # Each expert i gets a slot of (align_size - 1) positions (worst-case padding).
+    # Within slot i: positions where offset < padding_tokens_required_per_expert[i]
+    # are assigned to expert i; the rest point to the last expert and will be ignored
+    # by the GEMM (they sort to the tail of the buffer).
+    # E.g. padding_tokens_required_per_expert=(1,3), align_size=8 → total=14:
+    #   [0, last, last, last, last, last, last,   # slot 0: 1 real, 6 overflow
+    #    1, 1, 1, last, last, last, last]          # slot 1: 3 real, 4 overflow
+    max_padding_per_expert = self.config.te_permutation_align_size - 1
+    total_padding_size = self.num_experts * max_padding_per_expert
+    positions = jnp.arange(total_padding_size)
+    expert_for_pos = positions // max_padding_per_expert
+    offset_in_slot = positions % max_padding_per_expert
+    padding_needed = padding_tokens_required_per_expert[expert_for_pos]
+    flatten_padding_selected_experts = jnp.where(
+        offset_in_slot < padding_needed,
+        expert_for_pos,
+        self.num_experts - 1,
+    )
+
     lb_loss = None
     if self.config.load_balance_loss_weight > 0.0:
       softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
