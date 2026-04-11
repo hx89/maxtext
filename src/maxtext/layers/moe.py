@@ -843,31 +843,32 @@ class RoutedMoE(nnx.Module):
     weights, selected_experts = self.get_topk(gate_logits, pre_bias_logits, rngs)
 
     token_count_per_expert = jnp.bincount(selected_experts.ravel(), length=self.num_experts)
-    align_size = self.config.te_permutation_align_size
-    # Use (align - count % align) % align so that experts already aligned to
-    # align_size need 0 padding tokens (not align_size, which would exceed the
-    # per-expert slot capacity of align_size - 1).
-    padding_tokens_required_per_expert = (align_size - (token_count_per_expert % align_size)) % align_size
-    # Build a static-size padding index buffer.
-    # Each expert i gets a slot of (align_size - 1) positions (worst-case padding,
-    # which occurs when token_count[i] % align_size == 1).
-    # Within slot i: positions where offset < padding_tokens_required_per_expert[i]
-    # are assigned to expert i (real padding); the rest point to the last expert
-    # as overflow placeholders to keep the buffer statically sized.
-    # E.g. padding_tokens_required_per_expert=(1,3), align_size=8 → total=14:
-    #   [0, last, last, last, last, last, last,   # slot 0: 1 real, 6 overflow
-    #    1, 1, 1, last, last, last, last]          # slot 1: 3 real, 4 overflow
-    max_padding_per_expert = align_size - 1
-    total_padding_size = self.num_experts * max_padding_per_expert
-    positions = jnp.arange(total_padding_size)
-    expert_for_pos = positions // max_padding_per_expert
-    offset_in_slot = positions % max_padding_per_expert
-    padding_needed = padding_tokens_required_per_expert[expert_for_pos]
-    flatten_padding_selected_experts = jnp.where(
-        offset_in_slot < padding_needed,
-        expert_for_pos,
-        self.num_experts - 1,
-    )
+    align_size = self.config.moe_permutation_group_align_size
+    if align_size > 0:
+      # Use (align - count % align) % align so that experts already aligned to
+      # align_size need 0 padding tokens (not align_size, which would exceed the
+      # per-expert slot capacity of align_size - 1).
+      padding_tokens_required_per_expert = (align_size - (token_count_per_expert % align_size)) % align_size
+      # Build a static-size padding index buffer.
+      # Each expert i gets a slot of (align_size - 1) positions (worst-case padding,
+      # which occurs when token_count[i] % align_size == 1).
+      # Within slot i: positions where offset < padding_tokens_required_per_expert[i]
+      # are assigned to expert i (real padding); the rest point to the last expert
+      # as overflow placeholders to keep the buffer statically sized.
+      # E.g. padding_tokens_required_per_expert=(1,3), align_size=8 → total=14:
+      #   [0, last, last, last, last, last, last,   # slot 0: 1 real, 6 overflow
+      #    1, 1, 1, last, last, last, last]          # slot 1: 3 real, 4 overflow
+      max_padding_per_expert = align_size - 1
+      total_padding_size = self.num_experts * max_padding_per_expert
+      positions = jnp.arange(total_padding_size)
+      expert_for_pos = positions // max_padding_per_expert
+      offset_in_slot = positions % max_padding_per_expert
+      padding_needed = padding_tokens_required_per_expert[expert_for_pos]
+      flatten_padding_selected_experts = jnp.where(
+          offset_in_slot < padding_needed,
+          expert_for_pos,
+          self.num_experts - 1,
+      )
 
     lb_loss = None
     if self.config.load_balance_loss_weight > 0.0:
@@ -996,7 +997,7 @@ class RoutedMoE(nnx.Module):
         load_balance_loss_weight=self.config.load_balance_loss_weight,
         should_update_load_balance=self.should_update_load_balance(),
         routed_bias_update_rate=self.config.routed_bias_update_rate,
-        te_permutation_align_size=self.config.te_permutation_align_size,
+        moe_permutation_group_align_size=self.config.moe_permutation_group_align_size,
         roll_to_expert_id=roll_to_expert_id,
         num_experts_per_shard=num_experts_per_shard,
     )
