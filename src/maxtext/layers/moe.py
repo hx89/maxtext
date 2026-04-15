@@ -951,7 +951,8 @@ class RoutedMoE(nnx.Module):
         local_group_size,
     )
 
-  def _te_permute(self, inputs, gate_logits, gate_expert_bias, rngs=None, roll_to_expert_id=None):
+  def _te_permute(self, inputs, gate_logits, gate_expert_bias, rngs=None, roll_to_expert_id=None,
+                   num_experts_per_shard=None):
     """TE routing + permutation. Delegates to te_permutation.te_permute()."""
     return te_permutation.te_permute(
         inputs,
@@ -970,6 +971,7 @@ class RoutedMoE(nnx.Module):
         routed_bias_update_rate=self.config.routed_bias_update_rate,
         te_permutation_align_size=self.config.te_permutation_align_size,
         roll_to_expert_id=roll_to_expert_id,
+        num_experts_per_shard=num_experts_per_shard,
     )
 
   def _te_unpermute(
@@ -1049,7 +1051,7 @@ class RoutedMoE(nnx.Module):
     return output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
 
   def permute(self, inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp=True, rngs=None,
-              roll_to_expert_id=None, gate_expert_bias=None):
+              roll_to_expert_id=None, gate_expert_bias=None, num_experts_per_shard=None):
     """Permute tokens to group by expert. Dispatches to TE or MT implementation.
 
     Returns:
@@ -1065,6 +1067,7 @@ class RoutedMoE(nnx.Module):
       (x, perm_state.row_id_map, group_sizes, lb_loss, bias_updates,
        perm_state.dense_probs, perm_state.pad_offsets) = self._te_permute(
           inputs, gate_logits, gate_expert_bias, rngs, roll_to_expert_id,
+          num_experts_per_shard=num_experts_per_shard,
       )
 
       expert_indices = jnp.arange(self.num_experts)
@@ -1095,8 +1098,9 @@ class RoutedMoE(nnx.Module):
       Output tensor [batch, seq, hidden].
     """
     if perm_state.use_te:
-      # When using TE with padding, mask out garbage beyond actual tokens
-      if self.config.te_permutation_align_size > 0:
+      # When using TE with padding, mask out garbage beyond actual tokens.
+      # Only needed when padding was actually applied (pad_offsets is not None).
+      if perm_state.pad_offsets is not None:
         actual_tokens = jnp.sum(group_sizes)
         mask = jnp.arange(intermediate_output.shape[0]) < actual_tokens
         intermediate_output = jnp.where(mask[:, None], intermediate_output, 0)
