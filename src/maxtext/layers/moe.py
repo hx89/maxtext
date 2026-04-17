@@ -1537,8 +1537,7 @@ class RoutedMoE(nnx.Module):
     """Selects bias values for a variable number of bias tensors based on chosen experts."""
     return tuple(bias[experts_index] for bias in biases)
 
-  @staticmethod
-  def get_ragged_buffer_size(local_batch, ep_degree, global_experts, top_k, ragged_buffer_factor):
+  def get_ragged_buffer_size(self, local_batch, ep_degree, global_experts, top_k, ragged_buffer_factor):
     """Calculates the token batch size of the ragged buffer.
     When explicitly setting ragged_buffer_factor>0, this is balanced_size * ragged_buffer_factor, which can drop tokens.
     Otherwise this will be worst case size to ensure no dropping.
@@ -1555,6 +1554,8 @@ class RoutedMoE(nnx.Module):
     """
     balanced_size = local_batch
     if ragged_buffer_factor > 0.0:
+      if self.config.te_use_gmm or self.config.te_router_and_permutation_impl:
+        raise ValueError("ragged_buffer_factor is not supported with TE-based GMM or permutation.")
       # This will drop tokens if the true distribution exceeds this buffer.
       return int(balanced_size * ragged_buffer_factor)
     else:
@@ -1571,7 +1572,22 @@ class RoutedMoE(nnx.Module):
       # 256 exp / 8 top_k = 32. In practice the imbalance should be much less and potentially can use
       # ragged_buffer_factor set to >1  e.g. 3.0, and likely have no dropping (not guaranteed)
       worst_case_factor = min(ep_degree, global_experts / top_k)
-      return int(balanced_size * worst_case_factor)
+      buffer_size = int(balanced_size * worst_case_factor)
+
+      # When using alignment-based padding, the actual data size includes padding overhead.
+      # Each expert's tokens are aligned to moe_permutation_group_align_size, which increases the
+      # total token count. We need to ensure the buffer can hold the padded data.
+      # Note: Padding is applied in global permute, so this follows global mode.
+      # Applied for both TE and MT permutation to support future per-group padding in mt_permute.
+      align_size = self.config.moe_permutation_group_align_size
+      if align_size > 0:
+        local_expert_size = self.config.num_experts // ep_degree
+        # Add headroom for padding: each (shard, expert) chunk can add up to align_size-1 tokens
+        # Worst case: every chunk has 1 token, padded to align_size
+        # Total padding overhead = ep_degree * local_expert_size * (align_size - 1)
+        padding_headroom = int(ep_degree * local_expert_size * (align_size - 1))
+        buffer_size = buffer_size + padding_headroom
+      return buffer_size
 
   def sparse_matmul(
       self,
@@ -1630,6 +1646,15 @@ class RoutedMoE(nnx.Module):
           )
         output *= scales
       return output
+
+    def te_gmm(inputs, kernel, tiling, group_sizes, expert_assignments):
+      """ Execute GMM using TE-based implementation, with potential quantization. """
+      assert not self.config.megablox and not self.config.use_tokamax_gmm, "TE GMM is only supported when Megablox and Tokamax GMM are disabled."
+      assert self.config.quantization and self.config.quantization.startswith("te_"), "TE GMM currently requires TE quantization."
+      # TODO(jberchtold): Adjust this based on TE GMM requirements per recipe
+      te_gmm_align_size_requirement = self.quant.get_gmm_align_size(self.config.te_gmm_quantization)
+      assert self.config.moe_permutation_group_align_size % te_gmm_align_size_requirement == 0 and self.config.moe_permutation_group_align_size > 0, f"TE GMM currently requires permutation with alignment (moe_permutation_group_align_size > 0 and multiple of {te_gmm_align_size_requirement})."
+      return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments, self.config.te_gmm_quantization)
 
     def get_tokamax_group_sizes(group_sizes, inputs, kernel):
       if self.config.use_qwix_quantization:
