@@ -233,6 +233,14 @@ ModelName = Literal[
     "deepseek3-tiny",
     "deepseek3.2-671b",
     "deepseek-custom",
+    "deepseekv4-pro",
+    "deepseekv4-pro-2dfsdp",
+    "deepseekv4-pro-batchsplit",
+    "deepseekv4-tiny",
+    "deepseekv4-6layers",
+    "deepseekv4-flash",
+    "deepseekv4-flash-2dfsdp",
+    "deepseekv4-flash-batchsplit",
     "kimi-k2-1t",
     "gemma-7b",
     "gemma-2b",
@@ -577,6 +585,31 @@ class MlaAttention(BaseModel):
   qk_nope_head_dim: NonNegativeInt = Field(128, description="Dimension for non-RoPE part of QK heads in MLA.")
   qk_rope_head_dim: NonNegativeInt = Field(64, description="Dimension for RoPE part of QK heads in MLA.")
   v_head_dim: NonNegativeInt = Field(128, description="Dimension of V heads in MLA.")
+  # === DeepSeek-V4 additions ===
+  single_latent_kv: bool = Field(
+      False,
+      description="V4: skip wkv_b and use a single latent K=V vector shared by all query heads. Requires kv_lora_rank=0.",
+  )
+  o_groups: PositiveInt = Field(
+      1,
+      description="V4: number of groups for the grouped low-rank output projection. 1 = standard out projection.",
+  )
+  o_lora_rank: NonNegativeInt = Field(
+      0,
+      description="V4: LoRA rank for the grouped output projection (wo_a + wo_b). 0 = disabled (single out matmul).",
+  )
+  extra_q_rms_per_head: bool = Field(
+      False,
+      description="V4: apply scale-less RMSNorm to Q after wq_b (per-head), before RoPE.",
+  )
+  inverse_rope_on_attn_output: bool = Field(
+      False,
+      description="V4: apply conjugate RoPE to the last rope_dim of attention output before the output projection.",
+  )
+  attention_sink_in_mla: bool = Field(
+      False,
+      description="V4: enable per-head learnable softmax sink scalar inside MLA (in addition to the existing one in non-MLA).",
+  )
 
 
 class AttentionIndexer(BaseModel):
@@ -586,11 +619,39 @@ class AttentionIndexer(BaseModel):
   indexer_head_dim: NonNegativeInt = Field(128, description="Head dim for indexer query and key.")
   indexer_n_heads: NonNegativeInt = Field(64, description="Number of query heads in indexer.")
   indexer_topk: NonNegativeInt = Field(2048, description="Number of tokens selected by the query token in indexer.")
+  indexer_variant: Literal["v3.2", "v4"] = Field(
+      "v3.2",
+      description=(
+          "Indexer variant. 'v3.2': K from per-token wk(x). "
+          "'v4': K from internal Compressor (gated pool over compress_ratio tokens) with Hadamard rotation + FP4 QAT."
+      ),
+  )
   indexer_sparse_training: bool = Field(
       False,
       description="Determines the training strategy for the indexer: Dense Warm-up or Sparse Training stage.",
   )
   indexer_loss_scaling_factor: float = Field(0.0, description="Multiplier for the indexer KL divergence loss.")
+
+
+class V4KVCompression(BaseModel):
+  """DeepSeek-V4: per-layer learned KV compressor + alternating sliding/compressed attention."""
+
+  compress_ratios: list[NonNegativeInt] = Field(
+      default_factory=list,
+      description=(
+          "Per-layer KV compression ratio. 0 = pure sliding window (no compressed KV path). "
+          ">0 = layer also writes a compressed KV every `ratio` tokens via the Compressor. "
+          "Length must equal num_decoder_layers + mtp_num_layers (covers main stack + MTP). "
+          "Empty list disables the V4 hybrid attention scheme entirely."
+      ),
+  )
+  compress_rope_theta: NonNegativeFloat = Field(
+      0.0,
+      description=(
+          "RoPE base for layers with compress_ratios[i] > 0. 0 = use rope_max_timescale for all layers "
+          "(disables the V4 two-base scheme). V4-Pro uses 160000 here while pure-window layers keep 10000."
+      ),
+  )
 
 
 class Llama4Attention(BaseModel):
@@ -805,6 +866,21 @@ class DeepSeekMoE(BaseModel):
       1,
       description="Factor by which to split the batch into micro-batches. Only used if use_batch_split_schedule is True.",
   )
+  # === DeepSeek-V4 additions ===
+  swiglu_limit: NonNegativeFloat = Field(
+      0.0,
+      description=(
+          "V4: clamp magnitude on routed-expert SwiGLU gate/up before the activation. "
+          "0 disables. Shared expert is not clamped. V4-Pro uses 10.0."
+      ),
+  )
+  num_hash_layers: NonNegativeInt = Field(
+      0,
+      description=(
+          "V4: number of leading layers that use a frozen tid2eid lookup table for routing instead of "
+          "the learned gate. 0 disables (use score-based gating in every layer)."
+      ),
+  )
 
 
 class Qwen3Next(BaseModel):
@@ -1000,6 +1076,10 @@ class RematAndOffload(BaseModel):
   moe_dispatch: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for HybridEP dispatch output. Set to 'device' to avoid remat re-execution of dispatch FFI.",
+  )
+  moe_combine: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for HybridEP combine output. Set to 'device' to avoid remat re-execution of combine FFI (required for MHC+HybridEP).",
   )
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
@@ -1244,6 +1324,22 @@ class ManifoldConstrainedHyperConnections(BaseModel):
 
   mhc_expansion_rate: PositiveInt = Field(1, description="The number of parallel streams in Hyper Connection.")
   sinkhorn_iterations: PositiveInt = Field(20, description="The number of iterations for the Sinkhorn-Knopp algorithm.")
+  # === DeepSeek-V4 additions ===
+  mhc_layout: Literal["maxtext", "v4"] = Field(
+      "maxtext",
+      description=(
+          "MHC weight layout. 'maxtext': three matrices (res/pre/post_alpha) plus scalar gates. "
+          "'v4': single combined linear with split heads. The two layouts are mathematically equivalent; "
+          "the choice mostly affects checkpoint conversion."
+      ),
+  )
+  learned_hc_head_collapse: bool = Field(
+      False,
+      description=(
+          "V4: replace the parameter-free mhc_reduce (mean) at the LM head and MTP block with a learned "
+          "per-token sigmoid-weighted collapse using its own projection + scale + bias."
+      ),
+  )
 
 
 class DilocoParams(BaseModel):
@@ -2043,6 +2139,7 @@ class MaxTextConfig(
     MlaAttention,
     MoBa,
     AttentionIndexer,
+    V4KVCompression,
     Llama4Attention,
     SplashAttention,
     PagedAttention,
@@ -2138,6 +2235,41 @@ class MaxTextConfig(
       return  # Nothing to validate if not using ragged buffer factor
     if self.use_ring_of_experts:
       raise ValueError("Currently we only support ragged buffer factor with ragged a2a approach.")
+
+  @model_validator(mode="after")
+  def validate_deepseek_v4_settings(self) -> "MaxTextConfig":
+    """Cross-field validation for DeepSeek-V4-Pro additions.
+
+    All checks no-op when V4 features are disabled (defaults preserve V3 behavior).
+    """
+    # MLA single-latent K=V requires kv_lora_rank=0 (no wkv_b in V4).
+    if self.single_latent_kv and self.kv_lora_rank != 0:
+      raise ValueError(
+          f"single_latent_kv=True requires kv_lora_rank=0 (V4 skips wkv_b), got kv_lora_rank={self.kv_lora_rank}."
+      )
+    # Grouped output projection: if a LoRA rank is set, must be grouped.
+    if self.o_lora_rank > 0 and self.o_groups <= 1:
+      raise ValueError(
+          f"o_lora_rank>0 requires o_groups>1 (grouped low-rank output projection), got o_groups={self.o_groups}."
+      )
+    # compress_ratios length must match the full layer stack including MTP.
+    # Use base_num_decoder_layers (raw config) since num_decoder_layers (derived) is not yet computed.
+    if self.compress_ratios and self.base_num_decoder_layers is not None:
+      expected = self.base_num_decoder_layers + self.mtp_num_layers
+      if len(self.compress_ratios) != expected:
+        raise ValueError(
+            f"compress_ratios length {len(self.compress_ratios)} != base_num_decoder_layers ({self.base_num_decoder_layers}) "
+            f"+ mtp_num_layers ({self.mtp_num_layers}) = {expected}. Provide one ratio per main layer plus MTP layer."
+        )
+    # Hash-routed leading layers cannot exceed total layers and require shared experts (V4 always has 1).
+    if self.num_hash_layers > 0 and self.base_num_decoder_layers is not None:
+      if self.num_hash_layers > self.base_num_decoder_layers:
+        raise ValueError(
+            f"num_hash_layers ({self.num_hash_layers}) cannot exceed base_num_decoder_layers ({self.base_num_decoder_layers})."
+        )
+      if self.num_hash_layers > 0 and self.num_experts <= 1:
+        raise ValueError("num_hash_layers>0 requires an MoE configuration (num_experts>1).")
+    return self
 
   @model_validator(mode="after")
   def set_derived_and_validate_values(self) -> "MaxTextConfig":
@@ -2428,6 +2560,7 @@ class MaxTextConfig(
           "moe_mlpwi_1",
           "moe_mlpwo",
           "moe_dispatch",
+          "moe_combine",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",

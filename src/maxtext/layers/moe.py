@@ -347,7 +347,7 @@ class GateLogit(nnx.Module):
 
     if self.score_func:
       output = linears._convert_to_activation_function(self.score_func)(output)
-      if self.model_name.startswith("deepseek3"):
+      if self.model_name.startswith(("deepseek3", "deepseekv4")):
         pre_bias_logits = output
 
     if self.use_bias:
@@ -577,7 +577,7 @@ class RoutedMoE(nnx.Module):
       top_k_weights, top_k_indices = random_routing(rng, gate_logits, self.num_experts_per_tok)
       return top_k_weights, top_k_indices
 
-    if self.config.model_name.startswith("deepseek3"):
+    if self.config.model_name.startswith(("deepseek3", "deepseekv4")):
       top_k_weights, top_k_indices = self.deepseek_routing(gate_logits, pre_bias_logits)
     elif self.config.decoder_block == ctypes.DecoderBlockType.GEMMA4:
       router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
@@ -1560,10 +1560,9 @@ class RoutedMoE(nnx.Module):
       wo_bias_pspec = self._logical_to_mesh_axes(("exp", "activation_embed"))
 
     gate_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
-    if self.config.model_name.startswith("deepseek3"):
+    if self.config.model_name.startswith(("deepseek3", "deepseekv4")):
       pre_bias_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
     else:
-      # pre_bias_logits is None for non-DeepSeek v3 models
       pre_bias_logits_pspec = None
 
     # w0, w1, wo needs to be un sharded on fsdp / fsdp_transpose axis, so use
@@ -1945,7 +1944,7 @@ class RoutedMoE(nnx.Module):
             padding_headroom = int(self.num_experts * (align_size - 1))
             reverse_buffer_size = original_inputs_first_dim + padding_headroom
 
-          if sorted_selected_experts.shape[0] != original_inputs_first_dim:
+          if perm_state.sorted_selected_experts.shape[0] != original_inputs_first_dim:
             raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
           output_shape = jax.lax.empty(
               (
@@ -2029,7 +2028,7 @@ class RoutedMoE(nnx.Module):
       input_axes = (batch_logical_axis, "activation_norm_length", None)
 
     gate_logits_axes = (batch_logical_axis, "activation_norm_length", None)
-    if self.config.model_name.startswith("deepseek3"):
+    if self.config.model_name.startswith(("deepseek3", "deepseekv4")):
       pre_bias_logits_axes = (batch_logical_axis, "activation_norm_length", None)
     else:
       pre_bias_logits_axes = None
@@ -2314,8 +2313,7 @@ class RoutedMoE(nnx.Module):
     """Dense matrix multiplication."""
     # gate_logits: batch, length, expert
     gate_logits = self._maybe_shard_with_logical(gate_logits, ("activation_batch_moe", "activation_length_moe", None))
-    if self.config.model_name.startswith("deepseek3"):
-      # pre_bias_logits is None for non-DeepSeek v3 models
+    if self.config.model_name.startswith(("deepseek3", "deepseekv4")):
       pre_bias_logits = self._maybe_shard_with_logical(
           pre_bias_logits, ("activation_batch_moe", "activation_length_moe", None)
       )

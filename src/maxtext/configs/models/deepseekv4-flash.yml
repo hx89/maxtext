@@ -1,0 +1,137 @@
+# Copyright 2023–2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Model config for DeepSeek-V4-Flash: ~284B total / ~13B activated.
+# Mirrors https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/config.json on
+# production sizes (vocab, hidden dim, layer count, expert count/intermediate), but follows
+# the verified `deepseekv4-pro.yml` pattern of running on the V3-compatible code path until
+# each V4-only feature lands. Each TODO below points at the gating change.
+#
+# Key Flash deltas vs V4-Pro:
+#   * Smaller hidden (4096 vs 7168), fewer layers (43 vs 61), fewer query heads (64 vs 128)
+#   * Fewer experts (256 vs 384) with smaller intermediate (2048 vs 3072)
+#   * Smaller q_lora_rank (1024 vs 1536) and o_groups (8 vs 16)
+#   * routed_scaling_factor 1.5 (vs 2.5)
+#   * index_topk 512 (vs 1024) — same indexer head count/dim
+#   * compress_ratios starts [0, 0, ...] — first two layers are pure sliding (Pro starts [128, 128, ...])
+#
+# MTP is OFF by default, mirroring V3 convention. V4-Flash's HF release ships with
+# `num_nextn_predict_layers: 1`; to match the paper's training recipe, override on the CLI:
+#   mtp_num_layers=1 mtp_loss_scaling_factor=0.1
+# (and extend compress_ratios with one extra entry once that knob is re-enabled).
+#
+# When fully wired up the V4-Flash architecture is:
+#   * All 43 layers are MoE (no dense layers)
+#   * 256 routed experts + 1 shared, top-6, sqrtsoftplus scoring
+#   * First 3 layers route via frozen tid2eid hash lookup
+#   * MLA: single-latent K=V (head_dim=512, no wkv_b), grouped low-rank output projection (o_groups=8)
+#   * mHC at expansion_rate=4 with learned head/MTP collapse
+#   * Hybrid sliding(128) + per-layer compressed KV; ratios alternate [0,0] then [4,128] then [4]
+#   * Two RoPE bases: 10000 for pure-window, 160000 for compressed (1M context via YaRN x16)
+
+base_emb_dim: 4096
+base_num_query_heads: 64
+base_num_kv_heads: 64                 # TODO(V4): change to 1 when single-latent MLA is implemented (V3-style MLA requires num_kv_heads == num_query_heads)
+base_mlp_dim: 2048                    # must equal base_moe_mlp_dim when first_num_dense_layers=0
+base_moe_mlp_dim: 2048
+base_num_decoder_layers: 43
+first_num_dense_layers: 0             # all-MoE stack (V4 has no dense FFN layers)
+mlp_activations: ["silu","linear"]
+vocab_size: 129280
+enable_dropout: False
+logits_via_embedding: False
+normalization_layer_epsilon: 1.0e-6
+
+# MoE: V4-Flash production sizes + V3-compatible routing
+num_experts: 256
+num_experts_per_tok: 6
+shared_experts: 1
+routed_scaling_factor: 1.5            # V4-Flash uses 1.5 (vs V4-Pro's 2.5)
+routed_score_func: "sqrtsoftplus"     # V4: sqrt(softplus(logits))
+routed_bias: True                     # noaux_tc: bias-only top-k
+n_routing_groups: -1                  # V4 dropped expert grouping (V3 used 8 groups × 4)
+topk_routing_group: -1
+# TODO(V4): re-enable when swiglu_limit is implemented
+# swiglu_limit: 10.0                  # V4: clamp gate/up on routed experts
+# TODO(V4): re-enable when hash routing is implemented
+num_hash_layers: 0                    # V4: first 3 layers use frozen tid2eid lookup (disabled for now)
+decoder_block: "deepseek"
+
+# MLA — V3-compatible shape until V4 single-latent is implemented
+# TODO(V4): single_latent_kv=True + kv_lora_rank=0 + head_dim=512 + grouped output LoRA needs MLA code changes (Phase 5b/5c).
+# For now, use V3-style MLA (per-head KV via wkv_b, separate v_head_dim) to exercise MoE/routing paths at V4-Flash scale.
+attention_type: "mla"
+q_lora_rank: 1024
+kv_lora_rank: 512                     # TODO(V4): change to 0 when single-latent MLA is implemented
+qk_nope_head_dim: 128                 # V3 default; V4-Flash uses head_dim 512 = 448 nope + 64 rope
+qk_rope_head_dim: 64
+v_head_dim: 128                       # V3 default; V4 makes V = K = single 512-dim latent
+# TODO(V4): re-enable these when single-latent MLA is implemented
+# o_groups: 8                         # V4-Flash: grouped low-rank output projection (Pro uses 16)
+# o_lora_rank: 1024
+# single_latent_kv: True
+# attention_sink_in_mla: True
+# inverse_rope_on_attn_output: True
+# extra_q_rms_per_head: True
+mscale: 1.0
+
+# RoPE — V3-compatible single-base setup until V4 two-base scheme is wired through compressor
+# TODO(V4): bump to max_position_embeddings=1048576 with rope_factor=16 over original 65536 once compressor lands (1M context)
+rope_type: "yarn"
+rope_max_timescale: 10000
+compress_rope_theta: 160000           # second base for compressed layers (unused until compressor lands)
+max_position_embeddings: 163840       # V3 default 160K; V4-Flash is 1M (requires compressor for fit)
+original_max_position_embeddings: 4096
+rope_factor: 40
+beta_fast: 32
+beta_slow: 1
+rope_interleave: True
+rope_truncate: True
+rope_attention_scaling: False
+
+# Hybrid sliding + compressed attention
+# TODO(V4): re-enable when compressor is implemented (Phase 5d)
+sliding_window_size: 0                # disabled for now (V4 uses 128)
+# compress_ratios:                     # 43 entries: [0, 0] then 20x [4, 128] then [4]
+#   [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+#    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+#    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4]
+
+# Indexer (only fires on ratio-4 layers)
+# TODO: indexer requires dot_product or flash+tokamax_splash attention, not cudnn_flash_jax
+use_indexer: False
+indexer_variant: "v4"
+indexer_n_heads: 64
+indexer_head_dim: 128
+indexer_topk: 512                     # V4-Flash uses 512 (vs V4-Pro's 1024)
+
+# MTP — disabled by default, mirroring V3 convention.
+# To enable for the MTP code path test: override `mtp_num_layers=1 mtp_loss_scaling_factor=0.1` on the CLI
+# (and extend compress_ratios with one extra entry once compress_ratios is re-enabled — V4-Flash's
+# reference uses 0 for the MTP block, like Pro).
+# Trainer gates everything MTP-related on `config.mtp_num_layers > 0`.
+# mtp_num_layers: 1
+# mtp_loss_scaling_factor: 0.1
+
+# mHC
+# TODO(V4): re-enable MHC when shape mismatch is fixed (expects 4D, gets 3D)
+# mhc_expansion_rate: 4
+# sinkhorn_iterations: 20
+# learned_hc_head_collapse: True
+
+# Optimizer (Muon already supported for decoder_block: deepseek).
+opt_type: "muon"
+muon_beta: 0.95
+muon_weight_decay: 0.0
+muon_consistent_rms: 0.2

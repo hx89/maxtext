@@ -266,6 +266,9 @@ topk_routing_group: -1 # number of top groups to route inputs. For EP,
 # all-to-all communication with compute. Currently only implemented with DeepSeek sparse layers.
 use_batch_split_schedule: False # a flag if splitting batch into micro-batches to hide communications that yields performance benefits.
 batch_split_factor: 1 # the factor by which to split the batch. Only used if use_batch_split_schedule is True.
+# DeepSeek-V4 MoE additions (defaults preserve V3 behavior).
+swiglu_limit: 0.0 # V4: clamp magnitude on routed-expert SwiGLU gate/up before activation. 0 disables. V4-Pro uses 10.0. Shared expert is not clamped.
+num_hash_layers: 0 # V4: number of leading layers that route via a frozen tid2eid lookup instead of the learned gate. 0 disables.
 
 # For complex architectures like llama4 there are repeated sets of
 # inhomogeneous layers. E.g. maverick uses [dense+rope, moe+rope, dense+rope, moe+nope]
@@ -334,6 +337,7 @@ moe_mlpwi_0: 'remat'
 moe_mlpwi_1: 'remat'
 moe_mlpwo: 'remat'
 moe_dispatch: 'remat'
+moe_combine: 'remat'
 query_proj: 'remat'
 key_proj: 'remat'
 value_proj: 'remat'
@@ -381,6 +385,8 @@ use_indexer: False
 indexer_head_dim: 128
 indexer_n_heads: 64
 indexer_topk: 2048
+# Indexer variant: 'v3.2' (DSA: K from per-token wk(x)) or 'v4' (K from internal Compressor + Hadamard rotation + FP4 QAT).
+indexer_variant: "v3.2"
 # Determines the training strategy for the indexer:
 # - False (Dense Warm-up): Computes indexer loss over all tokens. Used with `trainable_parameters_mask` to freeze other model parameters.
 # - True (Sparse Training): Computes indexer loss over top-k tokens only and detaches the indexer input for independent optimization.
@@ -389,12 +395,25 @@ indexer_sparse_training: False
 # Multiplier for the indexer KL divergence loss
 indexer_loss_scaling_factor: 0.0
 
+# DeepSeek-V4 hybrid sliding+compressed KV attention.
+# Empty list = disabled (no Compressor). When set, length must equal num_decoder_layers + mtp_num_layers.
+compress_ratios: []
+# RoPE base for layers with compress_ratios[i] > 0. 0 = use rope_max_timescale for all layers (disables the V4 two-base scheme).
+compress_rope_theta: 0.0
+
 # MLA parameters
 q_lora_rank: 0
 kv_lora_rank: 512
 qk_nope_head_dim: 128
 qk_rope_head_dim: 64
 v_head_dim: 128
+# DeepSeek-V4 MLA additions (defaults preserve V3 behavior).
+single_latent_kv: False # V4: skip wkv_b, single 512-dim latent K=V shared across all query heads. Requires kv_lora_rank=0.
+o_groups: 1 # V4: groups for grouped low-rank output projection. 1 = standard out projection.
+o_lora_rank: 0 # V4: LoRA rank for grouped output projection (wo_a + wo_b). 0 = disabled.
+extra_q_rms_per_head: False # V4: scale-less RMSNorm on Q after wq_b (per-head), before RoPE.
+inverse_rope_on_attn_output: False # V4: conjugate-RoPE on the last rope_dim of attention output before output projection.
+attention_sink_in_mla: False # V4: per-head learnable softmax sink scalar inside MLA.
 
 # QK-Clip (Muon Clip) Configuration
 use_qk_clip: False  # Enable QK-Clip (supported in MLA with DotProduct or Tokamax Splash)
@@ -1205,6 +1224,11 @@ force_q_layout: false
 mhc_expansion_rate: 1
 # The number of iterations for the Sinkhorn-Knopp algorithm.
 sinkhorn_iterations: 20
+# DeepSeek-V4 mHC additions (defaults preserve V3 behavior).
+# 'maxtext' = three matrices (res/pre/post_alpha) with scalar gates. 'v4' = single combined linear with split heads.
+mhc_layout: "maxtext"
+# V4: replace mhc_reduce (mean) at LM head and MTP block with a learned per-token sigmoid-weighted collapse.
+learned_hc_head_collapse: False
 
 ################################## DeepSeek Engram ##################################
 # Indices of transformer layers where Engram are integrated; leave empty [] to disable.
