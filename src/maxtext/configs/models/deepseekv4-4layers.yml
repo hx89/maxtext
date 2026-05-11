@@ -12,26 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Tiny version of DeepSeek-V4-Pro for fast tests (single host, CPU-friendly).
+# 4-layer version of DeepSeek-V4-Pro: production shapes, fewer layers for fast multi-step tests.
 #
-# Designed to exercise every V4-specific code path at minimal cost.
+# Designed to exercise every V4-specific code path with full embedding/expert dims.
 # MTP is OFF by default, mirroring the V3 convention (`deepseek3-tiny.yml` also leaves this off).
 # To exercise the MTP path, override on the CLI: `mtp_num_layers=1 mtp_loss_scaling_factor=0.1`
 # (and extend compress_ratios with one more entry once that knob is re-enabled).
 #
 # When fully wired up:
-#   * 6 main layers (+ 1 MTP layer when enabled)
-#   * num_hash_layers=2 → first 2 layers use hash routing, remaining 4 use sqrtsoftplus gating
-#   * compress_ratios alternates 16/4/16/4/16/0 → exercises sliding+compressed (ratio 16),
+#   * 4 main layers (+ 1 MTP layer when enabled)
+#   * num_hash_layers=2 → first 2 layers use hash routing, remaining 2 use sqrtsoftplus gating
+#   * compress_ratios alternates 16/4/16/0 → exercises sliding+compressed (ratio 16),
 #     sliding+compressed+indexer (ratio 4), and pure sliding window (ratio 0)
 #   * single_latent_kv + grouped output LoRA on
 #   * mHC at expansion_rate=4 with learned head collapse
 
-base_emb_dim: 128
-base_num_query_heads: 4
-base_num_kv_heads: 4                  # TODO(V4): change to 1 when single-latent MLA is implemented (V3-style MLA requires num_kv_heads == num_query_heads)
-base_mlp_dim: 64                      # must equal base_moe_mlp_dim when first_num_dense_layers=0
-base_moe_mlp_dim: 64
+base_emb_dim: 7168
+base_num_query_heads: 128
+base_num_kv_heads: 128                # TODO(V4): change to 1 when single-latent MLA is implemented (V3-style MLA requires num_kv_heads == num_query_heads)
+base_mlp_dim: 3072                    # must equal base_moe_mlp_dim when first_num_dense_layers=0
+base_moe_mlp_dim: 3072
 base_num_decoder_layers: 4
 first_num_dense_layers: 0             # all-MoE stack (V4 has no dense FFN layers)
 mlp_activations: ["silu","linear"]
@@ -59,11 +59,11 @@ decoder_block: "deepseek"
 # TODO(V4): single_latent_kv=True + kv_lora_rank=0 needs MLA code changes (Phase 3).
 # For now, use V3-style MLA with small kv_lora_rank to exercise MoE/routing paths.
 attention_type: "mla"
-q_lora_rank: 32
-kv_lora_rank: 32                      # TODO(V4): change to 0 when single-latent MLA is implemented
-qk_nope_head_dim: 32                  # head_dim 48 = 32 nope + 16 rope
-qk_rope_head_dim: 16
-v_head_dim: 48
+q_lora_rank: 1536
+kv_lora_rank: 512                     # TODO(V4): change to 0 when single-latent MLA is implemented
+qk_nope_head_dim: 128                 # V3 default; V4 uses head_dim 512 = 448 nope + 64 rope
+qk_rope_head_dim: 64
+v_head_dim: 128  
 # TODO(V4): re-enable these when single-latent MLA is implemented
 # o_groups: 2                         # V4: grouped low-rank output projection
 # o_lora_rank: 16

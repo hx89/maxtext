@@ -237,6 +237,7 @@ ModelName = Literal[
     "deepseekv4-pro-2dfsdp",
     "deepseekv4-pro-batchsplit",
     "deepseekv4-tiny",
+    "deepseekv4-4layers",
     "deepseekv4-6layers",
     "deepseekv4-flash",
     "deepseekv4-flash-2dfsdp",
