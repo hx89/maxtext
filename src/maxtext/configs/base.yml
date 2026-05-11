@@ -473,7 +473,7 @@ compile_xla_flags: "" # Compiler options e.g. compile_xla_flags="--xla_tpu_num_s
 # Parallelism
 shard_mode: "auto" # can be either auto or explicit
 custom_mesh_and_rule: "" # replace default mesh and logical rule by specifying yml name under config/mesh_and_rule/.
-mesh_axes: ['diloco', 'data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']
+mesh_axes: ['diloco', 'data', 'stage', 'fsdp', 'fsdp_transpose', 'lp', 'sequence', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']
 logical_axis_rules: [
                       # ==========================================
                       # Vocabulary Embedding
@@ -556,11 +556,11 @@ logical_axis_rules: [
                       ['embed', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
                       ['embed', ['fsdp', 'sequence', 'context', 'expert']],
                       ['norm', ['tensor', 'tensor_transpose']],
-                      ['layers', 'stage'],
+                      ['layers', ['lp']],
                       ['diloco', 'diloco'],
                       ['engram_dim', ['tensor']],
-                      ['dense_layers', []],
-                      ['moe_layers', []],
+                      ['dense_layers', ['lp']],
+                      ['moe_layers', ['lp']],
                       ['mhc', []],
                       # ==========================================
                       # Inference(Prefill, Decode, Cache)
@@ -606,6 +606,7 @@ dcn_diloco_parallelism: 1
 dcn_data_parallelism: -1  # recommended DCN axis to be auto-sharded
 dcn_fsdp_parallelism: 1
 dcn_fsdp_transpose_parallelism: 1
+dcn_lp_parallelism: 1  # DCN layer-FSDP. Layers/dense_layers/moe_layers shard over `lp`; 1 = no layer sharding (FSDP-only fallback).
 dcn_sequence_parallelism: 1  # never recommended
 dcn_context_parallelism: 1
 dcn_context_autoregressive_parallelism: 1
@@ -619,6 +620,7 @@ ici_diloco_parallelism: 1
 ici_data_parallelism: 1
 ici_fsdp_parallelism: -1 # recommended ICI axis to be auto-sharded
 ici_fsdp_transpose_parallelism: 1
+ici_lp_parallelism: 1  # ICI layer-FSDP. Layers/dense_layers/moe_layers shard over `lp`; 1 = no layer sharding (FSDP-only fallback).
 ici_sequence_parallelism: 1
 ici_context_parallelism: 1
 ici_context_autoregressive_parallelism: 1

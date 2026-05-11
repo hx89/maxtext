@@ -975,6 +975,13 @@ class DcnParallelism(BaseModel):
   dcn_data_parallelism: int = Field(-1, description="DCN axis for data parallelism.")
   dcn_fsdp_parallelism: int = Field(1, description="DCN axis for FSDP.")
   dcn_fsdp_transpose_parallelism: int = Field(1, description="DCN axis for FSDP transpose.")
+  dcn_lp_parallelism: int = Field(
+      1,
+      description=(
+          "DCN axis for layer-FSDP (LP). Layers/dense_layers/moe_layers shard over `lp`. "
+          "1 = no layer sharding; behaves like the legacy FSDP-only setup."
+      ),
+  )
   dcn_sequence_parallelism: int = Field(1, description="DCN axis for sequence parallelism (not recommended).")
   dcn_context_parallelism: int = Field(1, description="DCN axis for context parallelism.")
   dcn_context_autoregressive_parallelism: int = Field(1, description="DCN axis for context autoregressive parallelism.")
@@ -995,6 +1002,13 @@ class IciParallelism(BaseModel):
   ici_data_parallelism: int = Field(1, description="ICI axis for data parallelism.")
   ici_fsdp_parallelism: int = Field(-1, description="ICI axis for FSDP.")
   ici_fsdp_transpose_parallelism: int = Field(1, description="ICI axis for FSDP transpose.")
+  ici_lp_parallelism: int = Field(
+      1,
+      description=(
+          "ICI axis for layer-FSDP (LP). Layers/dense_layers/moe_layers shard over `lp`. "
+          "1 = no layer sharding; behaves like the legacy FSDP-only setup."
+      ),
+  )
   ici_sequence_parallelism: int = Field(1, description="ICI axis for sequence parallelism.")
   ici_context_parallelism: int = Field(1, description="ICI axis for context parallelism.")
   ici_context_autoregressive_parallelism: int = Field(1, description="ICI axis for context autoregressive parallelism.")
@@ -2931,6 +2945,7 @@ class MaxTextConfig(
         "stage": self.ici_pipeline_parallelism,
         "fsdp": self.ici_fsdp_parallelism,
         "fsdp_transpose": self.ici_fsdp_transpose_parallelism,
+        "lp": self.ici_lp_parallelism,
         "sequence": self.ici_sequence_parallelism,
         "context": self.ici_context_parallelism,
         "context_autoregressive": self.ici_context_autoregressive_parallelism,
@@ -2951,6 +2966,7 @@ class MaxTextConfig(
         "stage": self.dcn_pipeline_parallelism,
         "fsdp": self.dcn_fsdp_parallelism,
         "fsdp_transpose": self.dcn_fsdp_transpose_parallelism,
+        "lp": self.dcn_lp_parallelism,
         "sequence": self.dcn_sequence_parallelism,
         "context": self.dcn_context_parallelism,
         "context_autoregressive": self.dcn_context_autoregressive_parallelism,
