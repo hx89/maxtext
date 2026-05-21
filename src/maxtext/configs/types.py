@@ -761,6 +761,10 @@ class MoEGeneral(BaseModel):
       0,
       description="Optional SM cap passed to TE EP bootstrap; 0 lets TE choose.",
   )
+  te_ep_em_unfused_num_sms: int = Field(
+      0,
+      description="TE EP Expert-Major fanout mode: 0=fused, -1=unfused auto, N>0=unfused with N SMs.",
+  )
   forward_pass_only: bool = Field(
       False,
       description="Skip gradient computation in train_step. Forward pass only with dummy zero gradients.",
@@ -2860,6 +2864,8 @@ class MaxTextConfig(
           raise ValueError("te_ep_recv_capacity_factor must be positive.")
         if self.te_ep_max_num_sms < 0:
           raise ValueError("te_ep_max_num_sms must be non-negative.")
+        if self.te_ep_em_unfused_num_sms < -1:
+          raise ValueError("te_ep_em_unfused_num_sms must be -1, 0, or a positive SM cap.")
         if (
             self.te_gmm_quantization == TEGroupedGemmQuantizationType.TE_MXFP8
             and self.moe_permutation_group_align_size % 128 != 0

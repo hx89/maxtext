@@ -47,6 +47,7 @@ class TeEpState:
   dispatch_alignment: int
   hidden_dim: int
   max_num_sms: int
+  em_unfused_num_sms: int
   input_spec_2d: PartitionSpec
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
@@ -121,9 +122,9 @@ def calculate_te_ep_capacity(
   return target
 
 
-def _max_tokens_per_rank(config: Any, outer_size: int) -> int:
+def _max_tokens_per_rank(config: Any, leading_axis_size: int) -> int:
   global_tokens = int(config.micro_batch_size_to_train_on * config.max_target_length)
-  return max(1, math.ceil(global_tokens / max(1, outer_size)))
+  return max(1, math.ceil(global_tokens / max(1, leading_axis_size)))
 
 
 def _hidden_dim(config: Any) -> int:
@@ -141,8 +142,9 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
     raise ValueError(f"num_experts ({config.num_experts}) must be divisible by TE EP size ({ep_size}).")
 
   num_local_experts = int(config.num_experts) // ep_size
-  dispatch_alignment = int(config.moe_permutation_group_align_size)
-  max_tokens_per_rank = _max_tokens_per_rank(config, outer_size)
+  min_dispatch_alignment = int(config.moe_permutation_group_align_size)
+  expected_world_size = outer_size * ep_size
+  max_tokens_per_rank = _max_tokens_per_rank(config, expected_world_size)
   recv_capacity_per_rank = calculate_te_ep_capacity(
       max_tokens_per_rank=max_tokens_per_rank,
       ep_size=ep_size,
@@ -150,11 +152,13 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       top_k=int(config.num_experts_per_tok),
       num_local_experts=num_local_experts,
       recv_capacity_factor=float(config.te_ep_recv_capacity_factor),
-      dispatch_alignment=dispatch_alignment,
+      dispatch_alignment=min_dispatch_alignment,
   )
+  # TE's phuong/ep-unfused MoE example passes the full per-expert slot count as
+  # dispatch alignment, so match that layout contract for the MaxText GMM path.
+  dispatch_alignment = max(1, recv_capacity_per_rank // num_local_experts)
 
   leading_spec = (outer_axis, _TE_EP_AXIS) if outer_axis is not None else _TE_EP_AXIS
-  expected_world_size = outer_size * ep_size
   config_key = (
       _TE_EP_AXIS,
       outer_axis,
@@ -168,6 +172,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       dispatch_alignment,
       _hidden_dim(config),
       int(config.te_ep_max_num_sms),
+      int(config.te_ep_em_unfused_num_sms),
   )
 
   return TeEpState(
@@ -184,6 +189,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       dispatch_alignment=dispatch_alignment,
       hidden_dim=_hidden_dim(config),
       max_num_sms=int(config.te_ep_max_num_sms),
+      em_unfused_num_sms=int(config.te_ep_em_unfused_num_sms),
       input_spec_2d=PartitionSpec(leading_spec, None),
       input_spec_3d=PartitionSpec(leading_spec, None, None),
       ep_spec_2d=PartitionSpec(leading_spec, None),
@@ -227,6 +233,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         recv_capacity_per_rank=candidate.recv_capacity_per_rank,
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
+        em_unfused_num_sms=candidate.em_unfused_num_sms,
     )
 
   _TE_EP_STATE = candidate
@@ -235,7 +242,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       f"outer_axis={candidate.outer_axis}, ep_axis={candidate.ep_axis}, ep_size={candidate.ep_size}, "
       f"max_tokens_per_rank={candidate.max_tokens_per_rank}, "
       f"recv_capacity_per_rank={candidate.recv_capacity_per_rank}, "
-      f"dispatch_alignment={candidate.dispatch_alignment}"
+      f"dispatch_alignment={candidate.dispatch_alignment}, "
+      f"em_unfused_num_sms={candidate.em_unfused_num_sms}"
   )
   return _TE_EP_STATE
 

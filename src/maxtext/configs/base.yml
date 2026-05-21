@@ -214,6 +214,7 @@ use_te_ep: false # whether to use TransformerEngine NCCL EP for MoE dispatch/com
 hybrid_ep_pad_multiple: 128 # padding alignment for hybridEP expert GEMMs (128 required for te_mxfp8)
 te_ep_recv_capacity_factor: 1.0 # multiplier on TE EP worst-case recv_capacity_per_rank
 te_ep_max_num_sms: 0 # optional SM cap passed to TE EP bootstrap; 0 lets TE choose
+te_ep_em_unfused_num_sms: 0 # TE EP expert-major fanout mode: 0=fused, -1=unfused auto, >0=unfused SM cap
 forward_pass_only: false # skip gradient computation in train_step (forward pass only with dummy zero gradients)
 te_router_and_permutation_impl: false # whether to use TransformerEngine fused router and permutation kernels for MoE routing and token dispatch/combine
 moe_permutation_group_align_size: 128 # alignment size for MoE permutation group padding (MT and TE paths), set to 0 to disable
