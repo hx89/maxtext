@@ -1103,7 +1103,7 @@ def print_non_trivial_mesh_axis(mesh):
 def maybe_get_transformer_engine_context(config):
   """Runs a transformer engine context engine manager for GPUs only."""
   if config.hardware in ["gpu", "gpu_multiprocess"]:
-    with transformer_engine_context():
+    with transformer_engine_context(config):
       yield
   else:
     with dummy_context_manager():
@@ -1117,19 +1117,21 @@ def dummy_context_manager():
 
 
 @contextmanager
-def transformer_engine_context():
+def transformer_engine_context(config=None):
   """If TransformerEngine is available, this context manager will provide
   the library with MaxText-specific details needed for correcct operation."""
   try:
     from transformer_engine.jax.sharding import global_shard_guard, MeshResource  # pylint: disable=import-outside-toplevel
+    use_te_ep = getattr(config, "use_te_ep", False)
     # Inform TransformerEngine of MaxText's physical mesh resources.
     mesh_resource = MeshResource(  # pytype: disable=wrong-arg-types
-        dp_resource="data",
+        dp_resource=None if use_te_ep else "data",
         tp_resource="tensor",
         # tpsp_resource = "tensor_sequence", #TODO(Phuong): add this back when upstreaming CGEMM
         fsdp_resource="fsdp",
         pp_resource=None,
         cp_resource="context",
+        ep_resource="expert" if use_te_ep else None,
     )
     with global_shard_guard(mesh_resource):
       yield

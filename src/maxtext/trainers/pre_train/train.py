@@ -529,6 +529,13 @@ def train_loop(config, recorder, state=None):
     ffi_set_buffer_manager(mgr)
     max_logging.log("HybridEP buffer manager initialized")
 
+  mesh = None
+  if config.use_te_ep:
+    from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
+
+    mesh = maxtext_utils.get_mesh_from_config(config)
+    te_ep_init.init_te_ep_for_maxtext(config, mesh)
+
   (
       init_rng,
       checkpoint_manager,
@@ -541,7 +548,7 @@ def train_loop(config, recorder, state=None):
       rampup_manager,
       eval_data_iterator,
       state,
-  ) = train_utils.setup_train_loop(config, recorder)
+  ) = train_utils.setup_train_loop(config, recorder, mesh=mesh)
 
   if config.use_dpo:
     if "reference_params" not in state.params:

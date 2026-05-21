@@ -186,7 +186,7 @@ def jit_train_and_eval_step(
   return p_train_step, p_eval_step
 
 
-def setup_train_loop(config, recorder, devices=None):
+def setup_train_loop(config, recorder, devices=None, mesh=None):
   """Set up prerequisites for the training loop -
 
       checkpoint_manager, PRNG keys, Mesh, Model and optimizer.
@@ -216,7 +216,7 @@ def setup_train_loop(config, recorder, devices=None):
       # Create abstract NNX model.
       raise NotImplementedError("Pure NNX support has not been implemented yet.")
     else:
-      model = model_creation_utils.from_config(config, devices)
+      model = model_creation_utils.from_config(config, devices, mesh=mesh)
     mesh = model.mesh
     learning_rate_schedule, tx = create_training_optimizer(config, model)
     if config.pure_nnx:
