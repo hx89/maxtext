@@ -2070,7 +2070,9 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
-      with self.mesh, jax.set_mesh(self.mesh), global_shard_guard(state.mesh_resource):
+      # MaxText enters jax.set_mesh around tracing/lowering; calling it here
+      # fails because sparse_matmul is traced under jit.
+      with self.mesh, global_shard_guard(state.mesh_resource):
         recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
             top_k_indices_2d,
             x_2d,
