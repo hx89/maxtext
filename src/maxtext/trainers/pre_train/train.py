@@ -529,6 +529,15 @@ def train_loop(config, recorder, state=None):
     ffi_set_buffer_manager(mgr)
     max_logging.log("HybridEP buffer manager initialized")
 
+  # Initialize TE NCCL EP BEFORE setup_train_loop, because model creation traces
+  # moe.py which calls ep_dispatch — the process-singleton communicator must be
+  # live by then. The MeshResource (with ep_resource="expert") is already active
+  # via the outer transformer_engine_context wrapping run() in `initialize`.
+  if config.use_te_ep:
+    from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
+
+    te_ep_init.init_te_ep_for_maxtext(config, maxtext_utils.get_mesh_from_config(config))
+
   (
       init_rng,
       checkpoint_manager,
