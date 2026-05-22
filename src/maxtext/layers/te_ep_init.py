@@ -87,8 +87,7 @@ def _validate_v1_mesh(mesh: jax.sharding.Mesh, outer_axis: str | None) -> None:
     )
 
 
-def _make_mesh_resource(mesh: jax.sharding.Mesh, outer_axis: str | None, ep_axis: str) -> Any:
-  del mesh
+def _make_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
   from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
 
   kwargs = {"ep_resource": ep_axis}
@@ -177,7 +176,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   )
 
   return TeEpState(
-      mesh_resource=_make_mesh_resource(mesh, outer_axis, _TE_EP_AXIS),
+      mesh_resource=_make_mesh_resource(outer_axis, _TE_EP_AXIS),
       ep_axis=_TE_EP_AXIS,
       outer_axis=outer_axis,
       outer_size=outer_size,

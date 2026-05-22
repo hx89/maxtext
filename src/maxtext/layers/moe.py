@@ -2039,6 +2039,7 @@ class RoutedMoE(nnx.Module):
 
       from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
       from transformer_engine.jax.ep import ep_combine, ep_dispatch  # pylint: disable=import-outside-toplevel
+      from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
       state = te_ep_init.get_te_ep_state()
       batch_size, sequence_length, _ = x.shape
@@ -2069,13 +2070,14 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
-      recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
-          top_k_indices_2d,
-          x_2d,
-          weights_2d,
-          state.recv_capacity_per_rank,
-          state.dispatch_alignment,
-      )
+      with self.mesh, global_shard_guard(state.mesh_resource):
+        recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
+            top_k_indices_2d,
+            x_2d,
+            weights_2d,
+            state.recv_capacity_per_rank,
+            state.dispatch_alignment,
+        )
       recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
       recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
       token_counts = jax.lax.with_sharding_constraint(token_counts, ep_sharding_2d)
@@ -2227,19 +2229,21 @@ class RoutedMoE(nnx.Module):
         intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
         return intermediate_output.reshape(recv_t_local_shape)
 
-      expert_out = te_ep_expert_compute(
-          recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
-      )
+      with self.mesh, global_shard_guard(state.mesh_resource):
+        expert_out = te_ep_expert_compute(
+            recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
+        )
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
-      output = ep_combine(
-          handle,
-          token_counts,
-          expert_out,
-          recv_weights,
-          num_local_tokens,
-          out_sharding=tuple(state.input_spec_2d),
-      )
+      with self.mesh, global_shard_guard(state.mesh_resource):
+        output = ep_combine(
+            handle,
+            token_counts,
+            expert_out,
+            recv_weights,
+            num_local_tokens,
+            out_sharding=tuple(state.input_spec_2d),
+        )
       output = jax.lax.with_sharding_constraint(output, input_sharding)
       return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
 

@@ -518,19 +518,6 @@ def eval_step(model, config, state, data, dropout_rng):
   return metrics
 
 
-@contextlib.contextmanager
-def _maybe_te_ep_global_shard_guard(config):
-  """Keep TE EP mesh resources live during train-step lowering and execution."""
-  if getattr(config, "use_te_ep", False):
-    from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
-    from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
-
-    with global_shard_guard(te_ep_init.get_te_ep_state().mesh_resource):
-      yield
-  else:
-    yield
-
-
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
   # Initialize HybridEP buffer manager BEFORE setup_train_loop, because model creation
@@ -549,20 +536,19 @@ def train_loop(config, recorder, state=None):
     mesh = maxtext_utils.get_mesh_from_config(config)
     te_ep_init.init_te_ep_for_maxtext(config, mesh)
 
-  with _maybe_te_ep_global_shard_guard(config):
-    (
-        init_rng,
-        checkpoint_manager,
-        state_mesh_shardings,
-        model,
-        mesh,
-        learning_rate_schedule,
-        data_iterator,
-        data_loader,
-        rampup_manager,
-        eval_data_iterator,
-        state,
-    ) = train_utils.setup_train_loop(config, recorder, mesh=mesh)
+  (
+      init_rng,
+      checkpoint_manager,
+      state_mesh_shardings,
+      model,
+      mesh,
+      learning_rate_schedule,
+      data_iterator,
+      data_loader,
+      rampup_manager,
+      eval_data_iterator,
+      state,
+  ) = train_utils.setup_train_loop(config, recorder, mesh=mesh)
 
   if config.use_dpo:
     if "reference_params" not in state.params:
@@ -572,12 +558,7 @@ def train_loop(config, recorder, state=None):
 
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
-  with (
-      jax.set_mesh(mesh),
-      mesh,
-      _maybe_te_ep_global_shard_guard(config),
-      nn_partitioning.axis_rules(config.logical_axis_rules),
-  ):
+  with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
         config,
         model,
@@ -616,11 +597,7 @@ def train_loop(config, recorder, state=None):
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
-          with (
-              jax.set_mesh(mesh),
-              _maybe_te_ep_global_shard_guard(config),
-              nn_partitioning.axis_rules(config.logical_axis_rules),
-          ):
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             if config.shard_optimizer_over_data:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
@@ -652,11 +629,7 @@ def train_loop(config, recorder, state=None):
         for eval_batch in eval_data_iterator:
           if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
             break
-          with (
-              jax.set_mesh(mesh),
-              _maybe_te_ep_global_shard_guard(config),
-              nn_partitioning.axis_rules(config.logical_axis_rules),
-          ):
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             eval_metrics = p_eval_step(state, eval_batch, nextrng)
           metric_logger.record_eval_metrics(step, metrics=eval_metrics)
           max_logging.log(f"Completed eval step {eval_step_count}")
