@@ -763,7 +763,10 @@ class MoEGeneral(BaseModel):
   )
   te_ep_em_unfused_num_sms: int = Field(
       0,
-      description="TE EP Expert-Major fanout mode: 0=fused, -1=unfused auto, N>0=unfused with N SMs.",
+      description=(
+          "TE EP Expert-Major fanout mode: 0 uses the fused path, -1 uses TE's unfused auto mode, "
+          "and N>0 uses the unfused path capped at N SMs. Unfused modes are primarily debug/perf-tuning knobs."
+      ),
   )
   forward_pass_only: bool = Field(
       False,
@@ -2783,8 +2786,9 @@ class MaxTextConfig(
             f"Engram vocab size mismatch: expected {self.engram_max_ngram_size - 1} (max_ngram_size - 1), "
             f"but got {self.engram_vocab_bases}."
         )
-    if self.use_te_ep and self.num_experts <= 1:
-      raise ValueError("use_te_ep=True requires a sparse MoE model with num_experts > 1.")
+    if self.use_te_ep:
+      if self.num_experts <= 1:
+        raise ValueError("use_te_ep=True requires a sparse MoE model with num_experts > 1.")
     if self.num_experts > 1:
       if self.moe_mlp_dim <= 0:
         raise ValueError("moe_mlp_dim must be positive for MoE models (num_experts > 1)")
@@ -2834,7 +2838,10 @@ class MaxTextConfig(
         if "gpu" not in self.hardware:
           raise ValueError("use_te_ep=True is only supported on GPU hardware for v1.")
         if self.dcn_expert_parallelism != 1:
-          raise ValueError("use_te_ep=True requires dcn_expert_parallelism == 1 for v1.")
+          raise ValueError(
+              "use_te_ep=True requires dcn_expert_parallelism == 1 for v1; "
+              "TE NCCL EP is currently scoped to one NVLink domain, matching the HybridEP v1 constraint."
+          )
         if self.ici_expert_parallelism < 4:
           raise ValueError("use_te_ep=True requires ici_expert_parallelism >= 4 for v1.")
         if self.num_experts % self.ici_expert_parallelism != 0:

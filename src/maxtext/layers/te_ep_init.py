@@ -90,12 +90,18 @@ def _validate_v1_mesh(mesh: jax.sharding.Mesh, outer_axis: str | None) -> None:
 def _make_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
   from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
 
-  kwargs = {"ep_resource": ep_axis}
-  if outer_axis == "fsdp":
-    kwargs["fsdp_resource"] = outer_axis
-  elif outer_axis == "data":
-    kwargs["dp_resource"] = outer_axis
-  return MeshResource(**kwargs)
+  # Mirror MaxText's normal TransformerEngine context and add the EP axis.
+  # This keeps TP/CP resources visible to other TE-aware ops if they share the
+  # same lowering context, while TE EP still uses only data/FSDP + expert axes
+  # under the v1 validator.
+  return MeshResource(  # pytype: disable=wrong-arg-types
+      dp_resource="data" if outer_axis == "data" else None,
+      tp_resource="tensor",
+      fsdp_resource="fsdp",
+      pp_resource=None,
+      cp_resource="context",
+      ep_resource=ep_axis,
+  )
 
 
 def calculate_te_ep_capacity(

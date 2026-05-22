@@ -2033,15 +2033,21 @@ class RoutedMoE(nnx.Module):
       return output, lb_loss, bias_updates
 
     def te_ep_wrapper(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs):
-      """TE NCCL EP dispatch/combine path with MaxText expert compute."""
+      """TE NCCL EP dispatch/combine path with MaxText expert compute.
+
+      The regular sparse-matmul path runs inside shard_map. TE EP stays outside
+      that shard_map because its custom partitioner owns dispatch/combine
+      sharding from the global input tensors.
+      """
       if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
         raise NotImplementedError("use_te_ep=True is not implemented for LLAMA4's pre-weighted routing path.")
 
       from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
       from transformer_engine.jax.ep import ep_combine, ep_dispatch  # pylint: disable=import-outside-toplevel
-      from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
       state = te_ep_init.get_te_ep_state()
+      if state.dispatch_alignment <= 0:
+        raise ValueError("use_te_ep=True requires a positive dispatch_alignment for fixed per-expert slots.")
       batch_size, sequence_length, _ = x.shape
       num_local_tokens = batch_size * sequence_length
 
@@ -2070,7 +2076,7 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
-      with self.mesh, global_shard_guard(state.mesh_resource):
+      with self.mesh:
         recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
             top_k_indices_2d,
             x_2d,
@@ -2105,18 +2111,13 @@ class RoutedMoE(nnx.Module):
         recv_w = recv_w.reshape(state.recv_capacity_per_rank)
         counts = counts.reshape(-1, state.num_local_experts)[0]
 
-        if state.dispatch_alignment > 0:
-          # Aligned TE EP lays out a fixed slot block per local expert. Counts
-          # report occupancy; recv_w masks unused slots after expert compute.
-          group_sizes = jnp.full(
-              (state.num_local_experts,),
-              state.dispatch_alignment,
-              dtype=counts.dtype,
-          )
-        else:
-          group_sizes = counts
-          tail = jnp.asarray(state.recv_capacity_per_rank, dtype=group_sizes.dtype) - jnp.sum(group_sizes)
-          group_sizes = group_sizes.at[-1].add(jnp.maximum(tail, 0))
+        # Aligned TE EP lays out a fixed slot block per local expert. Counts
+        # report occupancy; recv_w masks unused slots after expert compute.
+        group_sizes = jnp.full(
+            (state.num_local_experts,),
+            state.dispatch_alignment,
+            dtype=counts.dtype,
+        )
 
         expert_indices = jnp.arange(state.num_local_experts, dtype=jnp.int32)
         selected_experts = jnp.repeat(
@@ -2229,13 +2230,13 @@ class RoutedMoE(nnx.Module):
         intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
         return intermediate_output.reshape(recv_t_local_shape)
 
-      with self.mesh, global_shard_guard(state.mesh_resource):
+      with self.mesh:
         expert_out = te_ep_expert_compute(
             recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
         )
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
-      with self.mesh, global_shard_guard(state.mesh_resource):
+      with self.mesh:
         output = ep_combine(
             handle,
             token_counts,
