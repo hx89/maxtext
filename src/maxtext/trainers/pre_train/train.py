@@ -549,19 +549,20 @@ def train_loop(config, recorder, state=None):
     mesh = maxtext_utils.get_mesh_from_config(config)
     te_ep_init.init_te_ep_for_maxtext(config, mesh)
 
-  (
-      init_rng,
-      checkpoint_manager,
-      state_mesh_shardings,
-      model,
-      mesh,
-      learning_rate_schedule,
-      data_iterator,
-      data_loader,
-      rampup_manager,
-      eval_data_iterator,
-      state,
-  ) = train_utils.setup_train_loop(config, recorder, mesh=mesh)
+  with _maybe_te_ep_global_shard_guard(config):
+    (
+        init_rng,
+        checkpoint_manager,
+        state_mesh_shardings,
+        model,
+        mesh,
+        learning_rate_schedule,
+        data_iterator,
+        data_loader,
+        rampup_manager,
+        eval_data_iterator,
+        state,
+    ) = train_utils.setup_train_loop(config, recorder, mesh=mesh)
 
   if config.use_dpo:
     if "reference_params" not in state.params:
