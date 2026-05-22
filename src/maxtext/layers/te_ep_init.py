@@ -108,21 +108,19 @@ def _validate_v1_mesh(mesh: jax.sharding.Mesh, outer_axis: str | None) -> None:
 
 
 def _build_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
-  """Build a MeshResource that ADDS ep_resource and preserves tp/cp/etc.
+  """Build a MeshResource for TE EP bootstrap.
 
-  v1's helper stripped tp_resource and cp_resource by only setting
-  ``fsdp_resource`` or ``dp_resource``. That left TE-aware code reading
-  ``gsr.tp_resource`` with ``None`` at lowering time — a latent bug if
-  ``te_use_gmm=True`` were ever combined with TE EP. v2 keeps the same
-  resource layout as :func:`maxtext.utils.max_utils.transformer_engine_context`
-  and adds the EP axis.
+  Sets ``fsdp_resource`` + ``ep_resource``; leaves ``tp_resource`` / ``cp_resource``
+  / ``dp_resource`` unset to match :func:`maxtext.utils.max_utils.transformer_engine_context`
+  under ``use_te_ep=true``. TE's ``_validate_mesh_resource_configuration`` calls
+  ``get_mesh_axis_size`` on every set resource, which asserts when the named
+  axis is missing from the active JAX mesh (e.g. inside ``jax.eval_shape``).
+  The TE EP validator already gates TP=CP=1 so stripping those is harmless.
   """
   from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
 
   kwargs: dict[str, Any] = {
-      "tp_resource": "tensor",
       "fsdp_resource": "fsdp",
-      "cp_resource": "context",
       "ep_resource": ep_axis,
   }
   if outer_axis == "data":

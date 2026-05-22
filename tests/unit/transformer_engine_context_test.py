@@ -50,15 +50,24 @@ class TransformerEngineContextTest(unittest.TestCase):
       self.assertEqual(mr.cp_resource, "context")
       self.assertIsNone(mr.ep_resource)
 
-  def test_with_te_ep_preserves_tp_cp_fsdp(self):
+  def test_with_te_ep_strips_tp_cp_dp(self):
+    """Under use_te_ep, tp/cp/dp are stripped to avoid TE's empty-mesh validation.
+
+    TE's _validate_mesh_resource_configuration calls get_mesh_axis_size on every
+    set resource at trace time. During jax.eval_shape (model init) there's no
+    active JAX mesh, so any set tp_resource="tensor"/cp_resource/dp_resource
+    asserts. v1 ran into this and worked around it by entering a `with self.mesh`
+    inside te_ep_wrapper; v2 strips them at the context-manager level since the
+    TE EP validator gates TP=CP=1 anyway.
+    """
     config = SimpleNamespace(use_te_ep=True)
     with max_utils.transformer_engine_context(config):
       mr = self._active_resource()
       self.assertEqual(mr.ep_resource, "expert")
-      self.assertEqual(mr.tp_resource, "tensor")
       self.assertEqual(mr.fsdp_resource, "fsdp")
-      self.assertEqual(mr.cp_resource, "context")
-      self.assertIsNone(mr.dp_resource)  # so TE outer falls through to fsdp_resource
+      self.assertIsNone(mr.tp_resource)
+      self.assertIsNone(mr.cp_resource)
+      self.assertIsNone(mr.dp_resource)
 
   def test_none_config_defaults_to_no_te_ep(self):
     with max_utils.transformer_engine_context(None):
