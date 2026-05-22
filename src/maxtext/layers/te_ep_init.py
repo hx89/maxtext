@@ -87,14 +87,21 @@ def _validate_v1_mesh(mesh: jax.sharding.Mesh, outer_axis: str | None) -> None:
     )
 
 
-def _make_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
+def _mesh_axis_if_present(mesh: jax.sharding.Mesh, axis: str) -> str | None:
+  return axis if axis in mesh.shape else None
+
+
+def _make_mesh_resource(mesh: jax.sharding.Mesh, outer_axis: str | None, ep_axis: str) -> Any:
   from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
 
-  kwargs = {"ep_resource": ep_axis}
-  if outer_axis == "fsdp":
-    kwargs["fsdp_resource"] = outer_axis
-  elif outer_axis == "data":
-    kwargs["dp_resource"] = outer_axis
+  kwargs = {
+      "dp_resource": "data" if outer_axis == "data" else None,
+      "tp_resource": _mesh_axis_if_present(mesh, "tensor"),
+      "fsdp_resource": _mesh_axis_if_present(mesh, "fsdp"),
+      "pp_resource": None,
+      "cp_resource": _mesh_axis_if_present(mesh, "context"),
+      "ep_resource": ep_axis,
+  }
   return MeshResource(**kwargs)
 
 
@@ -176,7 +183,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   )
 
   return TeEpState(
-      mesh_resource=_make_mesh_resource(outer_axis, _TE_EP_AXIS),
+      mesh_resource=_make_mesh_resource(mesh, outer_axis, _TE_EP_AXIS),
       ep_axis=_TE_EP_AXIS,
       outer_axis=outer_axis,
       outer_size=outer_size,

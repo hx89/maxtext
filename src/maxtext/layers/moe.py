@@ -2039,7 +2039,6 @@ class RoutedMoE(nnx.Module):
 
       from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
       from transformer_engine.jax.ep import ep_combine, ep_dispatch  # pylint: disable=import-outside-toplevel
-      from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
       state = te_ep_init.get_te_ep_state()
       batch_size, sequence_length, _ = x.shape
@@ -2070,177 +2069,179 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
-      # MaxText enters jax.set_mesh around tracing/lowering; calling it here
-      # fails because sparse_matmul is traced under jit.
-      with self.mesh, global_shard_guard(state.mesh_resource):
-        recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
-            top_k_indices_2d,
-            x_2d,
-            weights_2d,
-            state.recv_capacity_per_rank,
-            state.dispatch_alignment,
-        )
-        recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
-        recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
-        token_counts = jax.lax.with_sharding_constraint(token_counts, ep_sharding_2d)
+      recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
+          top_k_indices_2d,
+          x_2d,
+          weights_2d,
+          state.recv_capacity_per_rank,
+          state.dispatch_alignment,
+      )
+      recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
+      recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
+      token_counts = jax.lax.with_sharding_constraint(token_counts, ep_sharding_2d)
 
-        @functools.partial(
-            jax.shard_map,
-            mesh=self.mesh,
-            in_specs=(
-                state.ep_spec_3d,
-                state.ep_spec_2d,
-                state.ep_spec_2d,
-                w0_pspec,
-                w1_pspec,
-                wo_pspec,
-                w0_bias_pspec,
-                w1_bias_pspec,
-                wo_bias_pspec,
-            ),
-            out_specs=state.ep_spec_3d,
-            check_vma=False,
-        )
-        def te_ep_expert_compute(recv_t, recv_w, counts, w0, w1, wo, w0_bias, w1_bias, wo_bias):
-          recv_t_local_shape = recv_t.shape
-          recv_t = recv_t.reshape(state.recv_capacity_per_rank, -1)
-          recv_w = recv_w.reshape(state.recv_capacity_per_rank)
-          counts = counts.reshape(-1, state.num_local_experts)[0]
+      @functools.partial(
+          jax.shard_map,
+          mesh=self.mesh,
+          in_specs=(
+              state.ep_spec_3d,
+              state.ep_spec_2d,
+              state.ep_spec_2d,
+              w0_pspec,
+              w1_pspec,
+              wo_pspec,
+              w0_bias_pspec,
+              w1_bias_pspec,
+              wo_bias_pspec,
+          ),
+          out_specs=state.ep_spec_3d,
+          check_vma=False,
+      )
+      def te_ep_expert_compute(recv_t, recv_w, counts, w0, w1, wo, w0_bias, w1_bias, wo_bias):
+        recv_t_local_shape = recv_t.shape
+        recv_t = recv_t.reshape(state.recv_capacity_per_rank, -1)
+        recv_w = recv_w.reshape(state.recv_capacity_per_rank)
+        counts = counts.reshape(-1, state.num_local_experts)[0]
 
-          if state.dispatch_alignment > 1:
-            align = jnp.asarray(state.dispatch_alignment, dtype=counts.dtype)
-            group_sizes = ((counts + align - 1) // align) * align
-          else:
-            group_sizes = counts
+        if state.dispatch_alignment > 0:
+          # Aligned TE EP lays out a fixed slot block per local expert. Counts
+          # report occupancy; recv_w masks unused slots after expert compute.
+          group_sizes = jnp.full(
+              (state.num_local_experts,),
+              state.dispatch_alignment,
+              dtype=counts.dtype,
+          )
+        else:
+          group_sizes = counts
           tail = jnp.asarray(state.recv_capacity_per_rank, dtype=group_sizes.dtype) - jnp.sum(group_sizes)
           group_sizes = group_sizes.at[-1].add(jnp.maximum(tail, 0))
 
-          expert_indices = jnp.arange(state.num_local_experts, dtype=jnp.int32)
-          selected_experts = jnp.repeat(
-              expert_indices,
-              repeats=group_sizes,
-              total_repeat_length=state.recv_capacity_per_rank,
-          )
-
-          if self.config.mlp_bias:
-            w0_bias, w1_bias, wo_bias = self.transform_bias(selected_experts, w0_bias, w1_bias, wo_bias)
-
-          def get_active_sharding_axes(pspec_dim_axes, tensor_dim_index):
-            if pspec_dim_axes is None:
-              return []
-            axes = (pspec_dim_axes,) if isinstance(pspec_dim_axes, str) else pspec_dim_axes
-            active = []
-            for ax in axes:
-              if ax and self.mesh.shape.get(ax, 1) > 1:
-                active.append((ax, tensor_dim_index))
-            return active
-
-          wi_gather_axes = []
-          wo_gather_axes = []
-          if weight_gather:
-            wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[0], 0))
-            wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[2], 2))
-            wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[0], 0))
-            wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[1], 1))
-
-          gmm_fn = functools.partial(
-              gmm,
-              group_sizes=group_sizes,
-              expert_assignments=selected_experts,
-          )
-          wi_tile_size = (
-              self.config.wi_tile_fwd_batch_seq,
-              self.config.wi_tile_fwd_embed_dim,
-              self.config.wi_tile_fwd_mlp_dim,
-              self.config.wi_tile_dlhs_batch_seq,
-              self.config.wi_tile_dlhs_embed_dim,
-              self.config.wi_tile_dlhs_mlp_dim,
-              self.config.wi_tile_drhs_batch_seq,
-              self.config.wi_tile_drhs_embed_dim,
-              self.config.wi_tile_drhs_mlp_dim,
-          )
-          wo_tile_size = (
-              self.config.wo_tile_fwd_batch_seq,
-              self.config.wo_tile_fwd_embed_dim,
-              self.config.wo_tile_fwd_mlp_dim,
-              self.config.wo_tile_dlhs_batch_seq,
-              self.config.wo_tile_dlhs_embed_dim,
-              self.config.wo_tile_dlhs_mlp_dim,
-              self.config.wo_tile_drhs_batch_seq,
-              self.config.wo_tile_drhs_embed_dim,
-              self.config.wo_tile_drhs_mlp_dim,
-          )
-
-          if self.config.fused_moe_mlp:
-            w_fused = jnp.concatenate([w0, w1], axis=-1)
-            out = gmm_fn(recv_t, w_fused, tiling=wi_tile_size, weight_gather_axes=wi_gather_axes)
-            n = w0.shape[-1]
-            layer_w0, layer_w1 = out[:, :n], out[:, n:]
-            if self.get_tensor_transpose_parallelism_size() > 1:
-              layer_w0 = jax.lax.psum(layer_w0, "tensor_transpose")
-              layer_w1 = jax.lax.psum(layer_w1, "tensor_transpose")
-            if self.config.mlp_bias:
-              layer_w0 = layer_w0 + w0_bias
-              layer_w1 = layer_w1 + w1_bias
-            layer_w0 = adc.checkpoint_name(layer_w0, "moe_mlpwi_0")
-            layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
-          else:
-            layer_w0 = gmm_fn(
-                recv_t,
-                w0,
-                tiling=wi_tile_size,
-                weight_gather_axes=wi_gather_axes,
-            )
-            if self.get_tensor_transpose_parallelism_size() > 1:
-              layer_w0 = jax.lax.psum(layer_w0, "tensor_transpose")
-            if self.config.mlp_bias:
-              layer_w0 = layer_w0 + w0_bias
-            layer_w0 = adc.checkpoint_name(layer_w0, "moe_mlpwi_0")
-
-            layer_w1 = gmm_fn(
-                recv_t,
-                w1,
-                tiling=wi_tile_size,
-                weight_gather_axes=wi_gather_axes,
-            )
-            if self.get_tensor_transpose_parallelism_size() > 1:
-              layer_w1 = jax.lax.psum(layer_w1, "tensor_transpose")
-            if self.config.mlp_bias:
-              layer_w1 = layer_w1 + w1_bias
-            layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
-
-          intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
-          intermediate_output = gmm_fn(
-              intermediate_layer,
-              wo,
-              tiling=wo_tile_size,
-              weight_gather_axes=wo_gather_axes,
-          )
-          if self.get_tensor_parallelism_size() > 1:
-            intermediate_output = jax.lax.psum_scatter(
-                intermediate_output, self._tensor_parallelism_name, scatter_dimension=1, tiled=True
-            )
-          if self.config.mlp_bias:
-            intermediate_output = intermediate_output + wo_bias
-          intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
-          intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
-          return intermediate_output.reshape(recv_t_local_shape)
-
-        expert_out = te_ep_expert_compute(
-            recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
+        expert_indices = jnp.arange(state.num_local_experts, dtype=jnp.int32)
+        selected_experts = jnp.repeat(
+            expert_indices,
+            repeats=group_sizes,
+            total_repeat_length=state.recv_capacity_per_rank,
         )
-        if expert_out.dtype != jnp.bfloat16:
-          expert_out = expert_out.astype(jnp.bfloat16)
-        output = ep_combine(
-            handle,
-            token_counts,
-            expert_out,
-            recv_weights,
-            num_local_tokens,
-            out_sharding=tuple(state.input_spec_2d),
+
+        if self.config.mlp_bias:
+          w0_bias, w1_bias, wo_bias = self.transform_bias(selected_experts, w0_bias, w1_bias, wo_bias)
+
+        def get_active_sharding_axes(pspec_dim_axes, tensor_dim_index):
+          if pspec_dim_axes is None:
+            return []
+          axes = (pspec_dim_axes,) if isinstance(pspec_dim_axes, str) else pspec_dim_axes
+          active = []
+          for ax in axes:
+            if ax and self.mesh.shape.get(ax, 1) > 1:
+              active.append((ax, tensor_dim_index))
+          return active
+
+        wi_gather_axes = []
+        wo_gather_axes = []
+        if weight_gather:
+          wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[0], 0))
+          wi_gather_axes.extend(get_active_sharding_axes(w0_pspec[2], 2))
+          wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[0], 0))
+          wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[1], 1))
+
+        gmm_fn = functools.partial(
+            gmm,
+            group_sizes=group_sizes,
+            expert_assignments=selected_experts,
         )
-        output = jax.lax.with_sharding_constraint(output, input_sharding)
-        return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
+        wi_tile_size = (
+            self.config.wi_tile_fwd_batch_seq,
+            self.config.wi_tile_fwd_embed_dim,
+            self.config.wi_tile_fwd_mlp_dim,
+            self.config.wi_tile_dlhs_batch_seq,
+            self.config.wi_tile_dlhs_embed_dim,
+            self.config.wi_tile_dlhs_mlp_dim,
+            self.config.wi_tile_drhs_batch_seq,
+            self.config.wi_tile_drhs_embed_dim,
+            self.config.wi_tile_drhs_mlp_dim,
+        )
+        wo_tile_size = (
+            self.config.wo_tile_fwd_batch_seq,
+            self.config.wo_tile_fwd_embed_dim,
+            self.config.wo_tile_fwd_mlp_dim,
+            self.config.wo_tile_dlhs_batch_seq,
+            self.config.wo_tile_dlhs_embed_dim,
+            self.config.wo_tile_dlhs_mlp_dim,
+            self.config.wo_tile_drhs_batch_seq,
+            self.config.wo_tile_drhs_embed_dim,
+            self.config.wo_tile_drhs_mlp_dim,
+        )
+
+        if self.config.fused_moe_mlp:
+          w_fused = jnp.concatenate([w0, w1], axis=-1)
+          out = gmm_fn(recv_t, w_fused, tiling=wi_tile_size, weight_gather_axes=wi_gather_axes)
+          n = w0.shape[-1]
+          layer_w0, layer_w1 = out[:, :n], out[:, n:]
+          if self.get_tensor_transpose_parallelism_size() > 1:
+            layer_w0 = jax.lax.psum(layer_w0, "tensor_transpose")
+            layer_w1 = jax.lax.psum(layer_w1, "tensor_transpose")
+          if self.config.mlp_bias:
+            layer_w0 = layer_w0 + w0_bias
+            layer_w1 = layer_w1 + w1_bias
+          layer_w0 = adc.checkpoint_name(layer_w0, "moe_mlpwi_0")
+          layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
+        else:
+          layer_w0 = gmm_fn(
+              recv_t,
+              w0,
+              tiling=wi_tile_size,
+              weight_gather_axes=wi_gather_axes,
+          )
+          if self.get_tensor_transpose_parallelism_size() > 1:
+            layer_w0 = jax.lax.psum(layer_w0, "tensor_transpose")
+          if self.config.mlp_bias:
+            layer_w0 = layer_w0 + w0_bias
+          layer_w0 = adc.checkpoint_name(layer_w0, "moe_mlpwi_0")
+
+          layer_w1 = gmm_fn(
+              recv_t,
+              w1,
+              tiling=wi_tile_size,
+              weight_gather_axes=wi_gather_axes,
+          )
+          if self.get_tensor_transpose_parallelism_size() > 1:
+            layer_w1 = jax.lax.psum(layer_w1, "tensor_transpose")
+          if self.config.mlp_bias:
+            layer_w1 = layer_w1 + w1_bias
+          layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
+
+        intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
+        intermediate_output = gmm_fn(
+            intermediate_layer,
+            wo,
+            tiling=wo_tile_size,
+            weight_gather_axes=wo_gather_axes,
+        )
+        if self.get_tensor_parallelism_size() > 1:
+          intermediate_output = jax.lax.psum_scatter(
+              intermediate_output, self._tensor_parallelism_name, scatter_dimension=1, tiled=True
+          )
+        if self.config.mlp_bias:
+          intermediate_output = intermediate_output + wo_bias
+        intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
+        intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
+        return intermediate_output.reshape(recv_t_local_shape)
+
+      expert_out = te_ep_expert_compute(
+          recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
+      )
+      if expert_out.dtype != jnp.bfloat16:
+        expert_out = expert_out.astype(jnp.bfloat16)
+      output = ep_combine(
+          handle,
+          token_counts,
+          expert_out,
+          recv_weights,
+          num_local_tokens,
+          out_sharding=tuple(state.input_spec_2d),
+      )
+      output = jax.lax.with_sharding_constraint(output, input_sharding)
+      return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
 
     if self.config.moe_fsdp_use_two_stage_all_gather:
       # Unshard on fsdp axis
