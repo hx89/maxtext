@@ -138,6 +138,61 @@ class ConfigTest(unittest.TestCase):
           ]
       )
 
+  @staticmethod
+  def _te_ep_argv(*overrides):
+    """Shared argv for TE EP validator tests (sparse MoE, GPU, ep=4)."""
+    return [
+        "",
+        _BASE_CONFIG_PATH,
+        "run_name=te_ep_test",
+        "steps=1",
+        "hardware=gpu",
+        "num_experts=8",
+        "num_experts_per_tok=2",
+        "base_moe_mlp_dim=7168",
+        "ici_expert_parallelism=4",
+        "dcn_expert_parallelism=1",
+        *overrides,
+    ]
+
+  @patch("jax.devices")
+  def test_te_ep_valid_config(self, mock_devices):
+    """Narrow v1 TE EP config validates."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(4)]
+    config = pyconfig.initialize(self._te_ep_argv("use_te_ep=true"))
+    self.assertTrue(config.use_te_ep)
+    self.assertEqual(config.ici_expert_parallelism, 4)
+    self.assertEqual(config.dcn_expert_parallelism, 1)
+    self.assertEqual(config.te_ep_recv_capacity_factor, 1.0)
+
+  @patch("jax.devices")
+  def test_te_ep_rejects_multiple_ep_backends(self, mock_devices):
+    """TE EP cannot be combined with other EP backends."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(4)]
+    with self.assertRaisesRegex(pydantic.ValidationError, "mutually exclusive"):
+      pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "use_hybrid_ep=true"))
+
+  @patch("jax.devices")
+  def test_te_ep_rejects_tensor_parallelism(self, mock_devices):
+    """v1 gates TE EP to replicated hidden dims (no TP/CP/TSP)."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(8)]
+    with self.assertRaisesRegex(pydantic.ValidationError, "tensor parallelism size 1"):
+      pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "ici_tensor_parallelism=2"))
+
+  @patch("jax.devices")
+  def test_te_ep_rejects_non_power_of_two_alignment(self, mock_devices):
+    """TE EP requires a power-of-two per-expert alignment."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(4)]
+    with self.assertRaisesRegex(pydantic.ValidationError, "power of two"):
+      pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "moe_permutation_group_align_size=96"))
+
+  @patch("jax.devices")
+  def test_te_ep_rejects_ici_ep_below_four(self, mock_devices):
+    """TE EP requires ici_expert_parallelism >= 4 in v1."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(2)]
+    with self.assertRaisesRegex(pydantic.ValidationError, "ici_expert_parallelism >= 4"):
+      pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "ici_expert_parallelism=2"))
+
 
 if __name__ == "__main__":
   unittest.main()

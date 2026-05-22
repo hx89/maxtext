@@ -745,9 +745,25 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use DeepEP hybridEP for MoE dispatch/combine (NVLink domain, GPU only).",
   )
+  use_te_ep: bool = Field(
+      False,
+      description="Whether to use TransformerEngine NCCL EP for MoE dispatch/combine (NVLink domain, GPU only).",
+  )
   hybrid_ep_pad_multiple: int = Field(
       128,
       description="Padding alignment for hybridEP expert GEMMs. DeepEP pads each expert's tokens to this multiple. Must be 128 for te_mxfp8.",
+  )
+  te_ep_recv_capacity_factor: float = Field(
+      1.0,
+      description="Multiplier on TE EP worst-case recv_capacity_per_rank. 1.0 = exact worst case; >1.0 adds skew margin.",
+  )
+  te_ep_max_num_sms: int = Field(
+      0,
+      description="Optional SM cap passed to TE EP bootstrap; 0 lets TE choose.",
+  )
+  te_ep_em_unfused_num_sms: int = Field(
+      0,
+      description="TE EP Expert-Major fanout mode: 0=fused, -1=unfused auto, N>0=unfused with N SMs.",
   )
   forward_pass_only: bool = Field(
       False,
@@ -2798,7 +2814,66 @@ class MaxTextConfig(
         raise ValueError("te_gmm_quantization must be specified when te_use_gmm is True.")
       if self.fused_moe_mlp and not self.sparse_matmul:
         raise ValueError("fused_moe_mlp=True requires sparse_matmul=True.")
+      if self.use_te_ep:
+        enabled_backends = [
+            name
+            for name, enabled in (
+                ("use_te_ep", self.use_te_ep),
+                ("use_hybrid_ep", self.use_hybrid_ep),
+                ("use_ring_of_experts", self.use_ring_of_experts),
+            )
+            if enabled
+        ]
+        if len(enabled_backends) > 1:
+          raise ValueError(
+              "MoE EP backends are mutually exclusive; enable only one of "
+              f"use_te_ep, use_hybrid_ep, use_ring_of_experts. Got {enabled_backends}."
+          )
+        if not self.sparse_matmul:
+          raise ValueError("use_te_ep=True requires sparse_matmul=True.")
+        if "gpu" not in self.hardware:
+          raise ValueError("use_te_ep=True is only supported on GPU hardware for v1.")
+        if self.dcn_expert_parallelism != 1:
+          raise ValueError("use_te_ep=True requires dcn_expert_parallelism == 1 for v1.")
+        if self.ici_expert_parallelism < 4:
+          raise ValueError("use_te_ep=True requires ici_expert_parallelism >= 4 for v1.")
+        if self.num_experts % self.ici_expert_parallelism != 0:
+          raise ValueError(
+              "use_te_ep=True requires num_experts to be divisible by ici_expert_parallelism. "
+              f"Got num_experts={self.num_experts}, ici_expert_parallelism={self.ici_expert_parallelism}."
+          )
+        tensor_parallel_axes = {
+            "ici_tensor_parallelism": self.ici_tensor_parallelism,
+            "dcn_tensor_parallelism": self.dcn_tensor_parallelism,
+            "ici_tensor_transpose_parallelism": self.ici_tensor_transpose_parallelism,
+            "dcn_tensor_transpose_parallelism": self.dcn_tensor_transpose_parallelism,
+            "ici_tensor_sequence_parallelism": self.ici_tensor_sequence_parallelism,
+            "dcn_tensor_sequence_parallelism": self.dcn_tensor_sequence_parallelism,
+        }
+        active_tensor_axes = {name: size for name, size in tensor_parallel_axes.items() if size != 1}
+        if active_tensor_axes:
+          raise ValueError(
+              "use_te_ep=True requires tensor parallelism size 1 for v1; "
+              f"non-unit tensor axes: {active_tensor_axes}."
+          )
+        if self.moe_permutation_group_align_size <= 0:
+          raise ValueError("use_te_ep=True requires moe_permutation_group_align_size > 0 for aligned v1 dispatch.")
+        if self.moe_permutation_group_align_size & (self.moe_permutation_group_align_size - 1):
+          raise ValueError("use_te_ep=True requires moe_permutation_group_align_size to be a power of two.")
+        if self.te_ep_recv_capacity_factor <= 0:
+          raise ValueError("te_ep_recv_capacity_factor must be positive.")
+        if self.te_ep_max_num_sms < 0:
+          raise ValueError("te_ep_max_num_sms must be non-negative.")
+        if self.te_ep_em_unfused_num_sms < -1:
+          raise ValueError("te_ep_em_unfused_num_sms must be -1, 0, or a positive SM cap.")
+        if (
+            self.te_gmm_quantization == TEGroupedGemmQuantizationType.TE_MXFP8
+            and self.moe_permutation_group_align_size % 128 != 0
+        ):
+          raise ValueError("use_te_ep with te_mxfp8 requires moe_permutation_group_align_size to be a multiple of 128.")
       self.validate_ragged_buffer_factor()
+    if self.use_te_ep and self.num_experts <= 1:
+      raise ValueError("use_te_ep=True requires a sparse MoE model with num_experts > 1.")
     if self.use_multimodal:
       valid_mm_models = (
           "gemma3-4b",
