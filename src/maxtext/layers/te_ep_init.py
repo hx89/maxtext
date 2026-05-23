@@ -128,6 +128,13 @@ def _build_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
   return MeshResource(**kwargs)
 
 
+def _next_pow2(n: int) -> int:
+  """Smallest power of two >= n. n must be a positive int."""
+  if n <= 1:
+    return 1
+  return 1 << (n - 1).bit_length()
+
+
 def calculate_te_ep_capacity(
     *,
     max_tokens_per_rank: int,
@@ -150,6 +157,17 @@ def calculate_te_ep_capacity(
   total routing pool ``T_per_ep_group * top_k``. When ``dispatch_alignment``
   is set, the result is rounded up so each of ``num_local_experts`` experts
   gets ``slots_per_expert`` rows that are a multiple of ``dispatch_alignment``.
+
+  Two adjustments beyond the literal worst case:
+    * **+1 dispatch_alignment headroom** on slots_per_expert. Observed on
+      DSV3-tiny+256 experts and DSV3 671B: TE EP's internal accounting
+      reports actual recv slots > our computed capacity by exactly one
+      dispatch_alignment unit even with mathematically tight worst_case.
+    * **slots_per_expert rounded up to a power of 2**. TE EP's
+      ``ncclEpInitHandle`` asserts ``dispatch_output_per_expert_alignment``
+      is a power of two (the value we pass is
+      ``recv_capacity_per_rank // num_local_experts``, i.e. our
+      ``slots_per_expert`` here).
   """
   tokens_per_ep_group = max_tokens_per_rank * ep_size
   active_experts = min(num_experts, tokens_per_ep_group * top_k)
@@ -158,8 +176,10 @@ def calculate_te_ep_capacity(
   target = max(1, math.ceil(worst_case * recv_capacity_factor))
 
   if dispatch_alignment > 0:
-    slots_per_expert = math.ceil(target / num_local_experts / dispatch_alignment)
-    slots_per_expert = max(1, slots_per_expert) * dispatch_alignment
+    align_units = math.ceil(target / num_local_experts / dispatch_alignment)
+    align_units = max(1, align_units) + 1  # +1 headroom
+    align_units = _next_pow2(align_units)  # TE EP requires POW2 alignment
+    slots_per_expert = align_units * dispatch_alignment
     return num_local_experts * slots_per_expert
   return target
 

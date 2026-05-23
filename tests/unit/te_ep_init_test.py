@@ -37,9 +37,12 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
         recv_capacity_factor=1.0,
         dispatch_alignment=128,
     )
-    # T_per_ep_group=64, worst=64*2*1=128 → ceil(128/2/128)=1 → slots=128 → 2*128.
-    self.assertEqual(capacity, 256)
-    self.assertEqual(capacity % (2 * 128), 0)
+    # T_per_ep_group=64, worst=128, target=128. align_units=ceil(128/2/128)=1.
+    # +1 headroom -> 2. POW2(2)=2. slots=2*128=256. recv=2*256=512.
+    self.assertEqual(capacity, 512)
+    # slots_per_expert must be a power of two (TE EP assertion in ncclEpInitHandle).
+    slots = capacity // 2
+    self.assertEqual(slots & (slots - 1), 0, f"slots_per_expert={slots} not a power of two")
 
   def test_factor_before_alignment(self):
     capacity = te_ep_init.calculate_te_ep_capacity(
@@ -51,9 +54,32 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
         recv_capacity_factor=3.0,
         dispatch_alignment=128,
     )
-    # worst=128, target=ceil(128*3)=384 → ceil(384/2/128)=2 → slots=256 → 2*256.
-    self.assertEqual(capacity, 512)
-    self.assertEqual(capacity % (2 * 128), 0)
+    # worst=128, target=384. align_units=ceil(384/2/128)=2. +1=3. POW2(3)=4.
+    # slots=4*128=512. recv=2*512=1024.
+    self.assertEqual(capacity, 1024)
+    slots = capacity // 2
+    self.assertEqual(slots & (slots - 1), 0)
+
+  def test_pow2_round_up_from_non_pow2(self):
+    """An align_units count that's not a POW2 must be rounded up to next POW2.
+
+    DSV3 671B with rcf=1.5 reproduced this: align_units=3 → must round to 4.
+    """
+    capacity = te_ep_init.calculate_te_ep_capacity(
+        max_tokens_per_rank=8192,
+        ep_size=4,
+        num_experts=256,
+        top_k=8,
+        num_local_experts=64,
+        recv_capacity_factor=1.5,
+        dispatch_alignment=128,
+    )
+    # worst=8192*4*8=262144, target=ceil(262144*1.5)=393216.
+    # align_units = ceil(393216/64/128) = ceil(48) = 48. +1 = 49. POW2(49)=64.
+    # slots=64*128=8192. recv=64*8192=524288.
+    self.assertEqual(capacity, 524288)
+    slots = capacity // 64
+    self.assertEqual(slots & (slots - 1), 0)
 
   def test_unaligned(self):
     capacity = te_ep_init.calculate_te_ep_capacity(
