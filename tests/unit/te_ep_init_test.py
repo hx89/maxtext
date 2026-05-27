@@ -28,7 +28,7 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
   """Worst-case capacity math; no GPU / TE needed."""
 
   def test_aligned(self):
-    capacity = te_ep_init.calculate_te_ep_capacity(
+    recv_capacity, slots_per_expert = te_ep_init.calculate_te_ep_capacity(
         max_tokens_per_rank=16,
         ep_size=4,
         num_experts=8,
@@ -38,14 +38,18 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
         dispatch_alignment=128,
     )
     # T_per_ep_group=64, worst=128, target=128. align_units=ceil(128/2/128)=1.
-    # +1 headroom -> 2. POW2(2)=2. slots=2*128=256. recv=2*256=512.
-    self.assertEqual(capacity, 512)
+    # POW2(1)=1. slots=1*128=128. recv=(2+1)*128=384.
+    self.assertEqual(slots_per_expert, 128)
+    self.assertEqual(recv_capacity, 384)
     # slots_per_expert must be a power of two (TE EP assertion in ncclEpInitHandle).
-    slots = capacity // 2
-    self.assertEqual(slots & (slots - 1), 0, f"slots_per_expert={slots} not a power of two")
+    self.assertEqual(
+        slots_per_expert & (slots_per_expert - 1),
+        0,
+        f"slots_per_expert={slots_per_expert} not a power of two",
+    )
 
   def test_factor_before_alignment(self):
-    capacity = te_ep_init.calculate_te_ep_capacity(
+    recv_capacity, slots_per_expert = te_ep_init.calculate_te_ep_capacity(
         max_tokens_per_rank=16,
         ep_size=4,
         num_experts=8,
@@ -54,18 +58,18 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
         recv_capacity_factor=3.0,
         dispatch_alignment=128,
     )
-    # worst=128, target=384. align_units=ceil(384/2/128)=2. +1=3. POW2(3)=4.
-    # slots=4*128=512. recv=2*512=1024.
-    self.assertEqual(capacity, 1024)
-    slots = capacity // 2
-    self.assertEqual(slots & (slots - 1), 0)
+    # worst=128, target=384. align_units=ceil(384/2/128)=2. POW2(2)=2.
+    # slots=2*128=256. recv=(2+1)*256=768.
+    self.assertEqual(slots_per_expert, 256)
+    self.assertEqual(recv_capacity, 768)
+    self.assertEqual(slots_per_expert & (slots_per_expert - 1), 0)
 
   def test_pow2_round_up_from_non_pow2(self):
     """An align_units count that's not a POW2 must be rounded up to next POW2.
 
-    DSV3 671B with rcf=1.5 reproduced this: align_units=3 → must round to 4.
+    DSV3 671B with rcf=1.5 reproduced this: align_units=48 → POW2(48)=64.
     """
-    capacity = te_ep_init.calculate_te_ep_capacity(
+    recv_capacity, slots_per_expert = te_ep_init.calculate_te_ep_capacity(
         max_tokens_per_rank=8192,
         ep_size=4,
         num_experts=256,
@@ -75,14 +79,36 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
         dispatch_alignment=128,
     )
     # worst=8192*4*8=262144, target=ceil(262144*1.5)=393216.
-    # align_units = ceil(393216/64/128) = ceil(48) = 48. +1 = 49. POW2(49)=64.
-    # slots=64*128=8192. recv=64*8192=524288.
-    self.assertEqual(capacity, 524288)
-    slots = capacity // 64
-    self.assertEqual(slots & (slots - 1), 0)
+    # align_units = ceil(393216/64/128) = ceil(48) = 48. POW2(48)=64.
+    # slots=64*128=8192. recv=(64+1)*8192=532480.
+    self.assertEqual(slots_per_expert, 8192)
+    self.assertEqual(recv_capacity, 532480)
+    self.assertEqual(slots_per_expert & (slots_per_expert - 1), 0)
+
+  def test_dsv3_671b_bs2_rcf1_decoupled(self):
+    """DSV3 671B at bs=2 rcf=1.0: must give recv=(NLE+1)*slots, not 2x memory.
+
+    Regression test for the (NLE+1)*slots fix. With the old +1-on-align_units
+    formula this would jump to 524288 (POW2(33)=64 → 64*4096); the decoupled
+    formula keeps it at 266240 (65 * 4096).
+    """
+    recv_capacity, slots_per_expert = te_ep_init.calculate_te_ep_capacity(
+        max_tokens_per_rank=8192,
+        ep_size=4,
+        num_experts=256,
+        top_k=8,
+        num_local_experts=64,
+        recv_capacity_factor=1.0,
+        dispatch_alignment=128,
+    )
+    # worst=8192*4*8=262144, target=262144.
+    # align_units = ceil(262144/64/128) = 32. POW2(32)=32.
+    # slots=32*128=4096. recv=(64+1)*4096=266240.
+    self.assertEqual(slots_per_expert, 4096)
+    self.assertEqual(recv_capacity, 266240)
 
   def test_unaligned(self):
-    capacity = te_ep_init.calculate_te_ep_capacity(
+    recv_capacity, slots_per_expert = te_ep_init.calculate_te_ep_capacity(
         max_tokens_per_rank=4,
         ep_size=4,
         num_experts=8,
@@ -92,11 +118,13 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
         dispatch_alignment=0,
     )
     # T_per_ep_group=16, worst=max(16*2, 16)*1=32, target=ceil(32*1.5)=48, no alignment.
-    self.assertEqual(capacity, 48)
+    # Both return values equal target in unaligned mode.
+    self.assertEqual(recv_capacity, 48)
+    self.assertEqual(slots_per_expert, 48)
 
   def test_overconc_active_when_experts_exceed_pool(self):
     # T_per_ep_group * top_k = 1*1 = 1; num_experts=8 → overconc=8.
-    capacity = te_ep_init.calculate_te_ep_capacity(
+    recv_capacity, slots_per_expert = te_ep_init.calculate_te_ep_capacity(
         max_tokens_per_rank=1,
         ep_size=1,
         num_experts=8,
@@ -106,7 +134,8 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
         dispatch_alignment=0,
     )
     # active=min(8, 1)=1, overconc=ceil(8/1)=8, worst=max(1, 16)*8=128.
-    self.assertEqual(capacity, 128)
+    self.assertEqual(recv_capacity, 128)
+    self.assertEqual(slots_per_expert, 128)
 
 
 class ModuleSurfaceTest(unittest.TestCase):
