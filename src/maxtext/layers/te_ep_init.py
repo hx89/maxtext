@@ -309,10 +309,12 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   with mesh, jax.set_mesh(mesh), global_shard_guard(candidate.mesh_resource):
     # Latest TE EP renamed em_unfused_num_sms -> max_num_permute_sms.
-    # allow_handle_mem_reloc=True was needed in the 0526 container snapshot to dodge
-    # CUDA_ERROR_ILLEGAL_ADDRESS when CUSTOM_CALL is in XLA's command_buffer scope, but
-    # TE removed the need for it in a subsequent update — leave it at the default per
-    # TE team guidance.
+    # allow_handle_mem_reloc=True is required when XLA's CUSTOM_CALL is in the
+    # command_buffer scope: XLA reallocates the EP handle_mem between captures
+    # and TE EP's get_or_open_handle() asserts unless reloc is allowed. Empirically
+    # both DSV3 671B at 20L (job 1924032, old formula) and 61L (job 1925466,
+    # new (NLE+1)*slots formula) hit the assertion without it — buffer size does
+    # not eliminate the reloc, only allowing it does.
     ep_bootstrap(
         world_size=world_size,
         rank=rank,
@@ -323,6 +325,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
         max_num_permute_sms=candidate.em_unfused_num_sms,
+        allow_handle_mem_reloc=True,
     )
 
   _TE_EP_STATE = candidate
