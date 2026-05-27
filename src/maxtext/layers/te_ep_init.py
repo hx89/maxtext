@@ -298,12 +298,11 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
   with mesh, jax.set_mesh(mesh), global_shard_guard(candidate.mesh_resource):
-    # Latest TE EP (phuong/ep-unfused @ faf4efd2+) renames em_unfused_num_sms -> max_num_permute_sms
-    # and adds allow_handle_mem_reloc. allow_handle_mem_reloc=True is REQUIRED for CUDA-graph
-    # capture (CUSTOM_CALL in XLA command_buffer scope) — XLA reallocates handle_mem between
-    # JIT invocations; without this flag the captured graph references the old address and
-    # replay hits CUDA_ERROR_ILLEGAL_ADDRESS (observed: job 1915114, container 0520 which
-    # predates this fix).
+    # Latest TE EP renamed em_unfused_num_sms -> max_num_permute_sms.
+    # allow_handle_mem_reloc=True was needed in the 0526 container snapshot to dodge
+    # CUDA_ERROR_ILLEGAL_ADDRESS when CUSTOM_CALL is in XLA's command_buffer scope, but
+    # TE removed the need for it in a subsequent update — leave it at the default per
+    # TE team guidance.
     ep_bootstrap(
         world_size=world_size,
         rank=rank,
@@ -314,7 +313,6 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
         max_num_permute_sms=candidate.em_unfused_num_sms,
-        allow_handle_mem_reloc=True,
     )
 
   _TE_EP_STATE = candidate
