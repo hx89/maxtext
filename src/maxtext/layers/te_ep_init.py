@@ -21,12 +21,20 @@ installed; TE imports happen lazily inside :func:`init_te_ep_for_maxtext`.
 Lessons baked in (see plans/jax_hybridep/te_ep_maxtext_v2_todo.md and
 plans/jax_hybridep/te_ep_recv_capacity_overflow.md):
   * MeshResource preserves tp/cp from the outer context (does not strip).
-  * recv_capacity_per_rank uses ``T_per_ep_group * top_k * overconc * factor``
-    rounded up so per-expert slots are POW2 multiples of ``moe_permutation_group_align_size``.
-  * recv_capacity = ``(num_local_experts + 1) * slots_per_expert`` — the ``+1``
-    block is global headroom matching TE EP's internal ``+1 align unit`` accounting
-    overhead (see te_ep_recv_capacity_overflow.md for cross-config evidence).
-  * dispatch_alignment is set to ``slots_per_expert`` (decoupled from recv_capacity).
+  * ``dispatch_alignment`` passed to TE EP is the *small* alignment
+    ``moe_permutation_group_align_size`` (default 128). This minimizes per-expert
+    padding overhead, matching how HybridEP/DeepEP uses ``pad_multiple``. Earlier
+    versions forced ``dispatch_alignment = slots_per_expert`` (~4096) to get a
+    uniform per-expert reshape, but the resulting padding overhead under routing
+    skew always overflowed (each "hot" expert wastes one ~4096-slot block).
+  * ``recv_capacity_per_rank = (T_per_ep_group * top_k * overconc * factor) +
+    num_local_experts * dispatch_alignment``. The headroom term covers the
+    worst-case per-expert padding: every expert may pad up to one align unit (=
+    `dispatch_alignment - 1` slots wasted), so the global overhead is bounded
+    by ``num_local_experts * dispatch_alignment``.
+  * The MoE GMM consumer no longer assumes uniform per-expert blocks; it
+    computes ``padded_token_counts`` from the returned ``token_counts`` and uses
+    those as ``group_sizes`` (mirroring HybridEP's pattern in moe.py).
 """
 
 from __future__ import annotations
@@ -130,13 +138,6 @@ def _build_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
   return MeshResource(**kwargs)
 
 
-def _next_pow2(n: int) -> int:
-  """Smallest power of two >= n. n must be a positive int."""
-  if n <= 1:
-    return 1
-  return 1 << (n - 1).bit_length()
-
-
 def calculate_te_ep_capacity(
     *,
     max_tokens_per_rank: int,
@@ -146,36 +147,32 @@ def calculate_te_ep_capacity(
     num_local_experts: int,
     recv_capacity_factor: float,
     dispatch_alignment: int,
-) -> tuple[int, int]:
+) -> int:
   """Worst-case TE EP receive-buffer size per rank.
 
   Formula::
 
       T_per_ep_group = max_tokens_per_rank * ep_size
       worst_case     = max(T_per_ep_group * top_k, 16) * overconc
-      target         = ceil(worst_case * recv_capacity_factor)
+      target_tokens  = ceil(worst_case * recv_capacity_factor)
+      recv_capacity  = ceil_to(target_tokens + NLE * dispatch_alignment, dispatch_alignment)
 
   ``overconc`` covers the degenerate case where ``num_experts`` exceeds the
-  total routing pool ``T_per_ep_group * top_k``. When ``dispatch_alignment``
-  is set, the result is rounded up so each of ``num_local_experts`` experts
-  gets ``slots_per_expert`` rows that are a multiple of ``dispatch_alignment``.
+  total routing pool ``T_per_ep_group * top_k``. ``dispatch_alignment`` is the
+  per-expert padding granularity used by TE EP (mirrors HybridEP's
+  ``pad_multiple``); it should be a POW2 (TE EP's ``ncclEpInitHandle``
+  asserts ``dispatch_output_per_expert_alignment`` is power-of-two), and
+  defaults to ``moe_permutation_group_align_size`` (=128).
 
-  Returns ``(recv_capacity_per_rank, slots_per_expert)``. With
-  ``dispatch_alignment > 0``::
+  The ``NLE * dispatch_alignment`` headroom term covers the worst-case
+  per-expert padding overhead. TE EP allocates each expert's recv block as
+  ``ceil(actual_count / dispatch_alignment) * dispatch_alignment`` rows; under
+  routing skew, every expert can waste up to ``dispatch_alignment - 1`` rows,
+  so total padding overhead ≤ ``NLE * (dispatch_alignment - 1)``. Using
+  ``NLE * dispatch_alignment`` gives one full align-block of safety margin.
 
-      slots_per_expert        = next_pow2(ceil(target / NLE / align_in)) * align_in
-      recv_capacity_per_rank  = (num_local_experts + 1) * slots_per_expert
-
-  The ``+1`` block is **global headroom**, not per-expert: TE EP's
-  ``ncclEpUpdateHandle`` reports actual recv slots = ``(NLE+1) * slots_per_expert``
-  on every overflow we have observed (DSV3-tiny+256 experts, DSV3 671B at
-  multiple bs/rcf combos — see plans/jax_hybridep/te_ep_recv_capacity_overflow.md).
-  ``slots_per_expert`` itself stays POW2 to satisfy TE EP's
-  ``ncclEpInitHandle`` alignment assertion on
-  ``dispatch_output_per_expert_alignment``.
-
-  With ``dispatch_alignment == 0`` (unaligned mode for tests/diagnostics), both
-  return values equal ``target``.
+  With ``dispatch_alignment == 0`` (unaligned mode for tests/diagnostics),
+  the result equals ``target_tokens``.
   """
   tokens_per_ep_group = max_tokens_per_rank * ep_size
   active_experts = min(num_experts, tokens_per_ep_group * top_k)
@@ -184,12 +181,13 @@ def calculate_te_ep_capacity(
   target = max(1, math.ceil(worst_case * recv_capacity_factor))
 
   if dispatch_alignment > 0:
-    align_units = max(1, math.ceil(target / num_local_experts / dispatch_alignment))
-    align_units = _next_pow2(align_units)  # TE EP requires POW2 alignment
-    slots_per_expert = align_units * dispatch_alignment
-    recv_capacity = (num_local_experts + 1) * slots_per_expert  # +1 GLOBAL headroom block
-    return recv_capacity, slots_per_expert
-  return target, target
+    # Worst-case per-expert padding: each of NLE experts pads up to one
+    # dispatch_alignment block; the +1 margin keeps a full block of headroom.
+    recv_capacity = target + num_local_experts * dispatch_alignment
+    # Round recv_capacity up to a clean dispatch_alignment multiple.
+    recv_capacity = math.ceil(recv_capacity / dispatch_alignment) * dispatch_alignment
+    return recv_capacity
+  return target
 
 
 def _max_tokens_per_rank(config: Any, leading_axis_size: int) -> int:
@@ -220,7 +218,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   min_dispatch_alignment = int(config.moe_permutation_group_align_size)
   expected_world_size = outer_size * ep_size
   max_tokens_per_rank = _max_tokens_per_rank(config, expected_world_size)
-  recv_capacity_per_rank, slots_per_expert = calculate_te_ep_capacity(
+  recv_capacity_per_rank = calculate_te_ep_capacity(
       max_tokens_per_rank=max_tokens_per_rank,
       ep_size=ep_size,
       num_experts=int(config.num_experts),
@@ -229,12 +227,12 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       recv_capacity_factor=float(config.te_ep_recv_capacity_factor),
       dispatch_alignment=min_dispatch_alignment,
   )
-  # Uniform per-expert slot size. The dispatch output layout is
-  # [num_procs, num_local_experts, dispatch_alignment, hidden] after reshape;
-  # MoE GMM consumes it with group_sizes == [dispatch_alignment] * NLE.
-  # recv_capacity = (NLE+1) * slots_per_expert; dispatch_alignment is the
-  # per-expert slot size directly (decoupled from recv_capacity / NLE).
-  dispatch_alignment = max(1, slots_per_expert)
+  # dispatch_alignment is the *small* per-expert padding granularity (typically
+  # 128 = moe_permutation_group_align_size). The recv buffer holds variable-sized
+  # per-expert blocks of `ceil(token_counts[k] / dispatch_alignment) * dispatch_alignment`
+  # rows; the MoE GMM consumer computes those padded counts from `token_counts`
+  # and uses them as `group_sizes` (mirroring HybridEP/DeepEP's pattern).
+  dispatch_alignment = max(1, min_dispatch_alignment)
 
   leading_spec: Any = (outer_axis, _TE_EP_AXIS) if outer_axis is not None else _TE_EP_AXIS
   config_key = (

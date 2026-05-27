@@ -2104,6 +2104,7 @@ class RoutedMoE(nnx.Module):
           in_specs=(
               state.ep_spec_3d,
               state.ep_spec_2d,
+              state.ep_spec_2d,
               w0_pspec,
               w1_pspec,
               wo_pspec,
@@ -2114,21 +2115,24 @@ class RoutedMoE(nnx.Module):
           out_specs=state.ep_spec_3d,
           check_vma=False,
       )
-      def te_ep_expert_compute(recv_t, recv_w, w0, w1, wo, w0_bias, w1_bias, wo_bias):
-        # Per-shard shapes: recv_t [1, recv_capacity, H], recv_w [1, recv_capacity].
+      def te_ep_expert_compute(recv_t, recv_w, tc, w0, w1, wo, w0_bias, w1_bias, wo_bias):
+        # Per-shard shapes: recv_t [1, recv_capacity, H], recv_w [1, recv_capacity],
+        # tc [1, NLE] actual token counts per local expert (un-padded).
         recv_t_local_shape = recv_t.shape
         recv_t = recv_t.reshape(state.recv_capacity_per_rank, -1)
         recv_w = recv_w.reshape(state.recv_capacity_per_rank)
+        tc = tc.reshape(state.num_local_experts)
 
-        # UNIFORM group sizes — each local expert gets exactly `dispatch_alignment` rows
-        # (by construction: recv_capacity_per_rank = num_local_experts * dispatch_alignment).
-        # v1 rounded `token_counts` up to `dispatch_alignment` and dumped any leftover
-        # into the last expert, which broke under skewed routing (last expert's slot
-        # only has `dispatch_alignment` rows, so the GMM read past it). Padded rows
-        # are zeroed downstream via the `recv_w == 0` mask before ep_combine.
-        group_sizes = jnp.full(
-            (state.num_local_experts,), state.dispatch_alignment, dtype=jnp.int32
-        )
+        # Per-expert padded counts: TE EP lays each expert's block back-to-back in the
+        # recv buffer, each block sized `ceil(tc[k] / dispatch_alignment) * dispatch_alignment`
+        # rows (mirrors HybridEP's `pad_multiple` layout). The GMM consumer uses these
+        # padded counts as `group_sizes` so per-expert reads land at the right offsets.
+        # Padded slots within each expert's block have `recv_w == 0` (masked downstream
+        # before ep_combine). Any tail beyond the last expert's block (when total padded
+        # tokens < recv_capacity) is filled by `jnp.repeat` with the last expert index and
+        # also masked by recv_w == 0.
+        align = jnp.int32(state.dispatch_alignment)
+        group_sizes = ((tc + align - 1) // align) * align
         expert_indices = jnp.arange(state.num_local_experts, dtype=jnp.int32)
         selected_experts = jnp.repeat(
             expert_indices,
@@ -2209,7 +2213,7 @@ class RoutedMoE(nnx.Module):
         return intermediate_output.reshape(recv_t_local_shape)
 
       expert_out = te_ep_expert_compute(
-          recv_tokens, recv_weights, w0, w1, wo, w0_bias, w1_bias, wo_bias
+          recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
       )
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
