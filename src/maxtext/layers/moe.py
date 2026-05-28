@@ -2136,11 +2136,18 @@ class RoutedMoE(nnx.Module):
         # rows (mirrors HybridEP's `pad_multiple` layout). The GMM consumer uses these
         # padded counts as `group_sizes` so per-expert reads land at the right offsets.
         # Padded slots within each expert's block have `recv_w == 0` (masked downstream
-        # before ep_combine). Any tail beyond the last expert's block (when total padded
-        # tokens < recv_capacity) is filled by `jnp.repeat` with the last expert index and
-        # also masked by recv_w == 0.
+        # before ep_combine).
+        #
+        # Absorb the unused tail (recv_capacity − sum(padded)) into the last expert's group
+        # so `sum(group_sizes) == recv_capacity_per_rank`. This satisfies TE
+        # `GroupedQuantizeFFI`'s assertion `sum == m || sum == input_dims[0]`, which the
+        # H100 (sm_90) fallback for `te_mxfp8` exercises (Blackwell uses a different
+        # native MXFP8 path that skips the assertion). The tail rows have `recv_w == 0`,
+        # so the extra GEMM work for the last expert produces masked-out zeros.
         align = jnp.int32(state.dispatch_alignment)
-        group_sizes = ((tc + align - 1) // align) * align
+        padded = ((tc + align - 1) // align) * align
+        tail = jnp.int32(state.recv_capacity_per_rank) - padded.sum()
+        group_sizes = padded.at[-1].add(tail)
         expert_indices = jnp.arange(state.num_local_experts, dtype=jnp.int32)
         selected_experts = jnp.repeat(
             expert_indices,
