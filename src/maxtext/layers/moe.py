@@ -26,7 +26,6 @@ from flax import nnx
 import jax
 from jax import ad_checkpoint as adc
 from jax.experimental import xla_metadata
-from jax.experimental.compute_on import compute_on
 from jax.sharding import NamedSharding, Mesh
 from jax.sharding import PartitionSpec as P
 import jax.numpy as jnp
@@ -2088,19 +2087,12 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
-      # Place TE EP dispatch on the collective stream so XLA does not schedule it
-      # to overlap with other collectives (which serializes on the compute stream).
-      # Mirrors HybridEP's dispatch_differentiable, which is also @compute_on('gpu_stream:collective').
-      @compute_on("gpu_stream:collective")
-      def _ep_dispatch_collective(top_k, x_in, w_in):
-        return ep_dispatch(
-            top_k, x_in, w_in,
-            state.recv_capacity_per_rank,
-            state.dispatch_alignment,
-        )
-
-      recv_tokens, recv_weights, handle, token_counts = _ep_dispatch_collective(
-          top_k_indices_2d, x_2d, weights_2d
+      recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
+          top_k_indices_2d,
+          x_2d,
+          weights_2d,
+          state.recv_capacity_per_rank,
+          state.dispatch_alignment,
       )
       recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
       recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
@@ -2233,17 +2225,14 @@ class RoutedMoE(nnx.Module):
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
-      # Same rationale as _ep_dispatch_collective above: keep the EP combine on
-      # the collective stream.
-      @compute_on("gpu_stream:collective")
-      def _ep_combine_collective(handle_in, tc_in, expert_out_in, recv_w_in):
-        return ep_combine(
-            handle_in, tc_in, expert_out_in, recv_w_in,
-            num_local_tokens,
-            out_sharding=tuple(state.input_spec_2d),
-        )
-
-      output = _ep_combine_collective(handle, token_counts, expert_out, recv_weights)
+      output = ep_combine(
+          handle,
+          token_counts,
+          expert_out,
+          recv_weights,
+          num_local_tokens,
+          out_sharding=tuple(state.input_spec_2d),
+      )
       output = jax.lax.with_sharding_constraint(output, input_sharding)
       return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
 
