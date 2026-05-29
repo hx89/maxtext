@@ -71,6 +71,7 @@ class TeEpState:
   hidden_dim: int
   max_num_sms: int
   em_unfused_num_sms: int
+  needs_v1_tail_absorb: bool
   input_spec_2d: PartitionSpec
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
@@ -199,6 +200,30 @@ def _hidden_dim(config: Any) -> int:
   return int(config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim)
 
 
+def _needs_v1_tail_absorb() -> bool:
+  """True when local GPUs use TE's V1 GroupedQuantizeFFI path for MXFP8.
+
+  V1 enforces ``sum(group_sizes) == m || sum == input_dims[0]`` (see
+  ``transformer_engine/jax/csrc/extensions/quantization.cpp:385``). The V2
+  path used on sm_100+ (Blackwell) doesn't have this assertion. Our path-C1
+  variable-block layout has ``sum(padded_per_expert) < recv_capacity``, so
+  on sm_90 we must absorb the unused tail into the last expert's group to
+  satisfy the V1 assertion. On sm_100+ we skip tail-absorption to avoid the
+  ~17% perf cost (extra GMM rows + non-uniform group_sizes scheduling).
+  """
+  try:
+    from transformer_engine.jax.cpp_extensions.misc import (  # pylint: disable=import-outside-toplevel
+        get_min_device_compute_capability,
+    )
+  except ImportError:
+    # If TE isn't importable here we can't be using TE EP either; safe default.
+    return False
+  try:
+    return int(get_min_device_compute_capability()) < 100
+  except Exception:  # noqa: BLE001 - resilient: any failure → safe default
+    return False
+
+
 def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   """Build the TE EP state without mutating the process singleton.
 
@@ -233,6 +258,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   # rows; the MoE GMM consumer computes those padded counts from `token_counts`
   # and uses them as `group_sizes` (mirroring HybridEP/DeepEP's pattern).
   dispatch_alignment = max(1, min_dispatch_alignment)
+  needs_v1_tail_absorb = _needs_v1_tail_absorb()
 
   leading_spec: Any = (outer_axis, _TE_EP_AXIS) if outer_axis is not None else _TE_EP_AXIS
   config_key = (
@@ -249,6 +275,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       _hidden_dim(config),
       int(config.te_ep_max_num_sms),
       int(config.te_ep_em_unfused_num_sms),
+      needs_v1_tail_absorb,
   )
 
   return TeEpState(
@@ -266,6 +293,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       hidden_dim=_hidden_dim(config),
       max_num_sms=int(config.te_ep_max_num_sms),
       em_unfused_num_sms=int(config.te_ep_em_unfused_num_sms),
+      needs_v1_tail_absorb=needs_v1_tail_absorb,
       input_spec_2d=PartitionSpec(leading_spec, None),
       input_spec_3d=PartitionSpec(leading_spec, None, None),
       ep_spec_2d=PartitionSpec(leading_spec, None),

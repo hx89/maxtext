@@ -2129,17 +2129,19 @@ class RoutedMoE(nnx.Module):
         # padded counts as `group_sizes` so per-expert reads land at the right offsets.
         # Padded slots within each expert's block have `recv_w == 0` (masked downstream
         # before ep_combine).
-        #
-        # Absorb the unused tail (recv_capacity − sum(padded)) into the last expert's group
-        # so `sum(group_sizes) == recv_capacity_per_rank`. This satisfies TE
-        # `GroupedQuantizeFFI`'s assertion `sum == m || sum == input_dims[0]`, which the
-        # H100 (sm_90) fallback for `te_mxfp8` exercises (Blackwell uses a different
-        # native MXFP8 path that skips the assertion). The tail rows have `recv_w == 0`,
-        # so the extra GEMM work for the last expert produces masked-out zeros.
         align = jnp.int32(state.dispatch_alignment)
         padded = ((tc + align - 1) // align) * align
-        tail = jnp.int32(state.recv_capacity_per_rank) - padded.sum()
-        group_sizes = padded.at[-1].add(tail)
+        if state.needs_v1_tail_absorb:
+          # sm_90: TE's V1 GroupedQuantizeFFI fallback for MXFP8 asserts
+          # `sum(group_sizes) == m || sum == input_dims[0]`. Absorb the unused tail
+          # (recv_capacity − sum(padded)) into the last expert's group so the sum
+          # equals recv_capacity. The extra rows have `recv_w == 0` and produce
+          # masked-out zeros downstream. Adds ~17% GMM overhead but only path that
+          # works on Hopper. On Blackwell V2 path skips this assertion → no absorb.
+          tail = jnp.int32(state.recv_capacity_per_rank) - padded.sum()
+          group_sizes = padded.at[-1].add(tail)
+        else:
+          group_sizes = padded
         expert_indices = jnp.arange(state.num_local_experts, dtype=jnp.int32)
         selected_experts = jnp.repeat(
             expert_indices,
