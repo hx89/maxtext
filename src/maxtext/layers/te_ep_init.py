@@ -72,6 +72,7 @@ class TeEpState:
   max_num_sms: int
   em_unfused_num_sms: int
   needs_v1_tail_absorb: bool
+  ep_handle: Any  # tex.EpHandle (opaque dataclass with handle_id/top_k/alignment).
   input_spec_2d: PartitionSpec
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
@@ -294,6 +295,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       max_num_sms=int(config.te_ep_max_num_sms),
       em_unfused_num_sms=int(config.te_ep_em_unfused_num_sms),
       needs_v1_tail_absorb=needs_v1_tail_absorb,
+      ep_handle=None,  # populated by init_te_ep_for_maxtext after ep_bootstrap
       input_spec_2d=PartitionSpec(leading_spec, None),
       input_spec_3d=PartitionSpec(leading_spec, None, None),
       ep_spec_2d=PartitionSpec(leading_spec, None),
@@ -330,7 +332,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         f"outer_axis={candidate.outer_axis}, ep_size={candidate.ep_size}."
     )
 
-  from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
+  import dataclasses  # pylint: disable=import-outside-toplevel
+  from transformer_engine.jax.ep import ep_bootstrap, ep_make_handle  # pylint: disable=import-outside-toplevel
   from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
   with mesh, jax.set_mesh(mesh), global_shard_guard(candidate.mesh_resource):
@@ -354,7 +357,16 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         allow_handle_mem_reloc=True,
     )
 
-  _TE_EP_STATE = candidate
+  # Per-layer EP handle. With scan_layers=true the MoE wrapper is a single
+  # logical layer scanned over decoder depth — one handle is correct per TE's
+  # `ep_make_handle` docstring ("once per logical MoE layer"). If/when
+  # scan_layers=false (unrolled stack) lands, this needs to grow into a list
+  # of handles indexed by physical layer id.
+  ep_handle = ep_make_handle(
+      int(config.num_experts_per_tok),
+      dispatch_output_per_expert_alignment=candidate.dispatch_alignment,
+  )
+  _TE_EP_STATE = dataclasses.replace(candidate, ep_handle=ep_handle)
   max_logging.log(
       "TE EP initialized: "
       f"outer_axis={candidate.outer_axis}, ep_axis={candidate.ep_axis}, "
@@ -362,7 +374,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       f"max_tokens_per_rank={candidate.max_tokens_per_rank}, "
       f"recv_capacity_per_rank={candidate.recv_capacity_per_rank}, "
       f"dispatch_alignment={candidate.dispatch_alignment}, "
-      f"max_num_sms={candidate.max_num_sms}, em_unfused_num_sms={candidate.em_unfused_num_sms}"
+      f"max_num_sms={candidate.max_num_sms}, em_unfused_num_sms={candidate.em_unfused_num_sms}, "
+      f"ep_handle_id={getattr(ep_handle, 'handle_id', '?')}"
   )
   return _TE_EP_STATE
 

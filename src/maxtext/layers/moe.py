@@ -2087,12 +2087,15 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
-      recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
+      # New TE API (PR #3036): ep_dispatch takes the per-layer handle first and
+      # returns (recv_tokens, recv_topk_weights, handle_mem, token_counts);
+      # the matching ep_combine takes both handle and handle_mem.
+      recv_tokens, recv_weights, handle_mem, token_counts = ep_dispatch(
+          state.ep_handle,
           top_k_indices_2d,
           x_2d,
           weights_2d,
           state.recv_capacity_per_rank,
-          state.dispatch_alignment,
       )
       recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
       recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
@@ -2212,12 +2215,20 @@ class RoutedMoE(nnx.Module):
           layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
 
         intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
+        # Fuse the routing-weight multiplication with the mlpwo input quantize
+        # (mirror of HybridEP commit 216988a99). recv_w == 0 marks padded slots,
+        # so this also zeros padded rows before mlpwo. The matching ep_combine
+        # call passes ``recv_topk_weights=None`` so its internal
+        # ``weighted = expert_out * w * mask`` is skipped (TE PR #3036 made the
+        # weights argument optional).
+        intermediate_layer = (intermediate_layer * recv_w[:, None]).astype(jnp.bfloat16)
         intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size, weight_gather_axes=wo_gather_axes)
         if self.config.mlp_bias:
           intermediate_output = intermediate_output + wo_bias
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
-        # Mask out the padded slots so ep_combine doesn't include their contributions.
+        # mlp_bias re-introduces a non-zero value on padded rows even though
+        # the activation was zeroed; keep an explicit mask before ep_combine.
         intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
         return intermediate_output.reshape(recv_t_local_shape)
 
@@ -2227,11 +2238,15 @@ class RoutedMoE(nnx.Module):
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
+      # Pre-weight + mask already applied inside expert_compute, so pass
+      # recv_topk_weights=None to skip ep_combine's internal multiply
+      # (TE PR #3036). Padded slots are zeroed by the explicit mask above.
       output = ep_combine(
-          handle,
+          state.ep_handle,
+          handle_mem,
           token_counts,
           expert_out,
-          recv_weights,
+          None,
           num_local_tokens,
           out_sharding=tuple(state.input_spec_2d),
       )
