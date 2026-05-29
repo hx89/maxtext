@@ -2147,13 +2147,6 @@ class RoutedMoE(nnx.Module):
             total_repeat_length=state.recv_capacity_per_rank,
         )
 
-        # Zero out invalid rows BEFORE the GMM so FP8/MXFP8 per-tile absmax doesn't
-        # ingest uninitialized memory (per-expert padding within each block and the
-        # buffer tail absorbed into the last expert's group). One stray Inf/NaN in
-        # the input would otherwise poison the entire quant block's scale, producing
-        # NaN losses (observed in job 1943247 after enabling tail absorption).
-        recv_t = jnp.where(recv_w[:, None] != 0, recv_t, 0).astype(recv_t.dtype)
-
         if self.config.mlp_bias:
           w0_bias, w1_bias, wo_bias = self.transform_bias(selected_experts, w0_bias, w1_bias, wo_bias)
 
