@@ -2228,7 +2228,13 @@ class RoutedMoE(nnx.Module):
           # recv_w[:, None] to preserve ``recv_w * (activation @ wo + wo_bias)``.
           # Without this, mlp_bias=True configs (e.g. GPT-OSS) would compute
           # ``recv_w * (activation @ wo) + wo_bias`` instead.
-          intermediate_output = intermediate_output + wo_bias * recv_w[:, None]
+          # Cast the f32 routing weight into the activation dtype before the add
+          # so the f32 wo_bias*recv_w intermediate doesn't promote the (large)
+          # mlpwo output buffer for the rest of the shard_map body.
+          scaled_wo_bias = (
+              wo_bias.astype(jnp.float32) * recv_w[:, None]
+          ).astype(intermediate_output.dtype)
+          intermediate_output = intermediate_output + scaled_wo_bias
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
         # Padded slots are already zero after the pre-weight * recv_w (== 0)
