@@ -2224,11 +2224,16 @@ class RoutedMoE(nnx.Module):
         intermediate_layer = (intermediate_layer * recv_w[:, None]).astype(jnp.bfloat16)
         intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size, weight_gather_axes=wo_gather_axes)
         if self.config.mlp_bias:
-          intermediate_output = intermediate_output + wo_bias
+          # Pre-applied weight is on the matmul branch only; scale the bias by
+          # recv_w[:, None] to preserve ``recv_w * (activation @ wo + wo_bias)``.
+          # Without this, mlp_bias=True configs (e.g. GPT-OSS) would compute
+          # ``recv_w * (activation @ wo) + wo_bias`` instead.
+          intermediate_output = intermediate_output + wo_bias * recv_w[:, None]
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
-        # mlp_bias re-introduces a non-zero value on padded rows even though
-        # the activation was zeroed; keep an explicit mask before ep_combine.
+        # Padded slots are already zero after the pre-weight * recv_w (== 0)
+        # multiply, but mlp_bias contributes wo_bias * recv_w (also 0). Keep
+        # an explicit mask as a safety net.
         intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
         return intermediate_output.reshape(recv_t_local_shape)
 

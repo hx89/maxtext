@@ -269,6 +269,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       ep_size,
       expected_world_size,
       int(config.num_experts),
+      int(config.num_experts_per_tok),
       num_local_experts,
       max_tokens_per_rank,
       recv_capacity_per_rank,
@@ -313,6 +314,19 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   shape/resource mismatch.
   """
   global _TE_EP_STATE
+
+  if not bool(getattr(config, "scan_layers", False)):
+    # We allocate exactly one EpHandle per process below. TE requires distinct
+    # EpHandles per physical MoE layer, but plumbing layer-indexed handles
+    # into moe.py is not implemented yet. Until that lands, refuse to bootstrap
+    # under unrolled stacks so the singleton handle isn't silently shared across
+    # multiple physical layers (which TE flags as undefined behaviour).
+    raise ValueError(
+        "use_te_ep=True requires scan_layers=True. Unrolled MoE stacks would "
+        "share a single EpHandle across multiple physical layers, which TE's "
+        "ep_make_handle docstring forbids. Set scan_layers=true or wait for "
+        "per-physical-layer handle plumbing in moe.py."
+    )
 
   candidate = build_te_ep_state(config, mesh)
   if _TE_EP_STATE is not None:
