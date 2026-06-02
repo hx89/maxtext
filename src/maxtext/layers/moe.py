@@ -2221,18 +2221,27 @@ class RoutedMoE(nnx.Module):
         # call passes ``recv_topk_weights=None`` so its internal
         # ``weighted = expert_out * w * mask`` is skipped (TE PR #3036 made the
         # weights argument optional).
-        intermediate_layer = (intermediate_layer * recv_w[:, None]).astype(jnp.bfloat16)
+        #
+        # stop_gradient on recv_w matches HybridEP's dispatched_probs handling
+        # (jax_deep_ep/autodiff.py:84). MoE routing is treated as non-differentiable;
+        # gate-logit gradient comes from the load-balance loss, not from the routing
+        # multiplier path. Without the stop, the (now amplified by ~mlp_dim) gradient
+        # through this pre-mlpwo multiply blows up step 1 (job 1977760: loss NaN).
+        recv_w_sg = jax.lax.stop_gradient(recv_w)
+        intermediate_layer = (intermediate_layer * recv_w_sg[:, None]).astype(jnp.bfloat16)
         intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size, weight_gather_axes=wo_gather_axes)
         if self.config.mlp_bias:
           # Pre-applied weight is on the matmul branch only; scale the bias by
           # recv_w[:, None] to preserve ``recv_w * (activation @ wo + wo_bias)``.
           # Without this, mlp_bias=True configs (e.g. GPT-OSS) would compute
-          # ``recv_w * (activation @ wo) + wo_bias`` instead.
+          # ``recv_w * (activation @ wo) + wo_bias`` instead. Use the stop_gradient'd
+          # weight to stay consistent with the pre-multiply branch (no extra
+          # gradient signal to gate logits through the bias path).
           # Cast the f32 routing weight into the activation dtype before the add
           # so the f32 wo_bias*recv_w intermediate doesn't promote the (large)
           # mlpwo output buffer for the rest of the shard_map body.
           scaled_wo_bias = (
-              wo_bias.astype(jnp.float32) * recv_w[:, None]
+              wo_bias.astype(jnp.float32) * recv_w_sg[:, None]
           ).astype(intermediate_output.dtype)
           intermediate_output = intermediate_output + scaled_wo_bias
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
