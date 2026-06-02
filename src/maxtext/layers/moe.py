@@ -2215,35 +2215,14 @@ class RoutedMoE(nnx.Module):
           layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
 
         intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
-        # Fuse the routing-weight multiplication with the mlpwo input quantize
-        # (mirror of HybridEP commit 216988a99). recv_w == 0 marks padded slots,
-        # so this also zeros padded rows before mlpwo. The matching ep_combine
-        # call passes ``recv_topk_weights=None`` so its internal
-        # ``weighted = expert_out * w * mask`` is skipped (TE PR #3036 made the
-        # weights argument optional).
-        #
-        # stop_gradient on recv_w matches HybridEP's dispatched_probs handling
-        # (jax_deep_ep/autodiff.py:84). MoE routing is treated as non-differentiable;
-        # gate-logit gradient comes from the load-balance loss, not from the routing
-        # multiplier path. Without the stop, the (now amplified by ~mlp_dim) gradient
-        # through this pre-mlpwo multiply blows up step 1 (job 1977760: loss NaN).
-        recv_w_sg = jax.lax.stop_gradient(recv_w)
-        intermediate_layer = (intermediate_layer * recv_w_sg[:, None]).astype(jnp.bfloat16)
+        # DEBUG: temporarily disable activation pre-weight fusion to isolate
+        # NaN cause between the new TE EP API (PR #3036) and the fusion math.
+        # The matching ep_combine still passes recv_w as recv_topk_weights so
+        # its internal weighted = expert_out * w * mask path is exercised
+        # (matches OLD TE EP path that worked at ~427 TFLOP/s on job 1949999).
         intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size, weight_gather_axes=wo_gather_axes)
         if self.config.mlp_bias:
-          # Pre-applied weight is on the matmul branch only; scale the bias by
-          # recv_w[:, None] to preserve ``recv_w * (activation @ wo + wo_bias)``.
-          # Without this, mlp_bias=True configs (e.g. GPT-OSS) would compute
-          # ``recv_w * (activation @ wo) + wo_bias`` instead. Use the stop_gradient'd
-          # weight to stay consistent with the pre-multiply branch (no extra
-          # gradient signal to gate logits through the bias path).
-          # Cast the f32 routing weight into the activation dtype before the add
-          # so the f32 wo_bias*recv_w intermediate doesn't promote the (large)
-          # mlpwo output buffer for the rest of the shard_map body.
-          scaled_wo_bias = (
-              wo_bias.astype(jnp.float32) * recv_w_sg[:, None]
-          ).astype(intermediate_output.dtype)
-          intermediate_output = intermediate_output + scaled_wo_bias
+          intermediate_output = intermediate_output + wo_bias
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
         # Padded slots are already zero after the pre-weight * recv_w (== 0)
@@ -2258,15 +2237,16 @@ class RoutedMoE(nnx.Module):
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
-      # Pre-weight + mask already applied inside expert_compute, so pass
-      # recv_topk_weights=None to skip ep_combine's internal multiply
-      # (TE PR #3036). Padded slots are zeroed by the explicit mask above.
+      # DEBUG: with fusion disabled in expert_compute, restore ep_combine's
+      # internal weighting by passing recv_weights (instead of None). Matches
+      # the OLD TE EP path that worked on job 1949999 — isolates whether NaN
+      # is from the new ep_make_handle/handle_mem API or the fusion math.
       output = ep_combine(
           state.ep_handle,
           handle_mem,
           token_counts,
           expert_out,
-          None,
+          recv_weights,
           num_local_tokens,
           out_sharding=tuple(state.input_spec_2d),
       )
