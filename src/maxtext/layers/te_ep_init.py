@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import os
 from typing import Any
 
 import jax
@@ -246,7 +247,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   min_dispatch_alignment = int(config.moe_permutation_group_align_size)
   expected_world_size = outer_size * ep_size
   max_tokens_per_rank = _max_tokens_per_rank(config, expected_world_size)
-  recv_capacity_per_rank = calculate_te_ep_capacity(
+  derived_recv_capacity = calculate_te_ep_capacity(
       max_tokens_per_rank=max_tokens_per_rank,
       ep_size=ep_size,
       num_experts=int(config.num_experts),
@@ -255,6 +256,29 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       recv_capacity_factor=float(config.te_ep_recv_capacity_factor),
       dispatch_alignment=min_dispatch_alignment,
   )
+  # Mirrors HybridEP's JAX_DEEP_EP_MAX_PERMUTED_TOKENS env-var override. Set to
+  # a tighter (or larger) static recv-buffer size without editing the yaml — the
+  # rest of the formula (per-expert alignment, mesh) stays the same. Useful for
+  # quick A/B benchmarks of dispatch/combine output buffer sizing.
+  override_env = os.environ.get("TE_EP_RECV_CAPACITY_PER_RANK", "").strip()
+  if override_env:
+    override_val = int(override_env)
+    if override_val <= 0:
+      raise ValueError(
+          f"TE_EP_RECV_CAPACITY_PER_RANK must be positive, got {override_val}"
+      )
+    if min_dispatch_alignment > 0 and override_val % min_dispatch_alignment != 0:
+      raise ValueError(
+          f"TE_EP_RECV_CAPACITY_PER_RANK={override_val} must be a multiple of "
+          f"moe_permutation_group_align_size={min_dispatch_alignment}."
+      )
+    max_logging.log(
+        f"TE EP: overriding recv_capacity_per_rank from env "
+        f"{derived_recv_capacity} -> {override_val}"
+    )
+    recv_capacity_per_rank = override_val
+  else:
+    recv_capacity_per_rank = derived_recv_capacity
   # dispatch_alignment is the *small* per-expert padding granularity (typically
   # 128 = moe_permutation_group_align_size). The recv buffer holds variable-sized
   # per-expert blocks of `ceil(token_counts[k] / dispatch_alignment) * dispatch_alignment`
