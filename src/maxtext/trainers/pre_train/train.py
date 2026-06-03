@@ -525,7 +525,14 @@ def train_loop(config, recorder, state=None):
   if config.use_hybrid_ep:
     import jax_deep_ep
     from jax_deep_ep.ffi_ops import set_buffer_manager as ffi_set_buffer_manager
-    mgr = jax_deep_ep.init(maxtext_config=config)
+    init_kwargs = {}
+    mp_env = os.environ.get("JAX_DEEP_EP_MAX_PERMUTED_TOKENS", "").strip()
+    if mp_env:
+      init_kwargs["max_permuted_tokens"] = int(mp_env)
+      max_logging.log(
+          f"HybridEP: overriding max_permuted_tokens from env -> {init_kwargs['max_permuted_tokens']}"
+      )
+    mgr = jax_deep_ep.init(maxtext_config=config, **init_kwargs)
     ffi_set_buffer_manager(mgr)
     max_logging.log("HybridEP buffer manager initialized")
 
