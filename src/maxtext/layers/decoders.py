@@ -941,15 +941,29 @@ class Decoder(nn.Module):
                     num_layers=num_moe_layers,
                 )
             else:
-              y, _ = self.scan_decoder_layers(
-                  cfg,
-                  moe_layer,
-                  num_moe_layers,
-                  "moe_layers",
-                  mesh,
-                  in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
-                  model_mode=model_mode,
-              )(y, *broadcast_args)
+              if cfg.use_te_ep:
+                # Thread per-layer scan index so te_ep_wrapper can select the
+                # correct EpHandle via lax.switch for each scan iteration.
+                layer_indices = jnp.arange(num_moe_layers, dtype=jnp.int32)
+                y, _ = self.scan_decoder_layers(
+                    cfg,
+                    moe_layer,
+                    num_moe_layers,
+                    "moe_layers",
+                    mesh,
+                    in_axes_tuple=(nn.broadcast,) * len(broadcast_args) + (0,),
+                    model_mode=model_mode,
+                )(y, *broadcast_args, layer_indices)
+              else:
+                y, _ = self.scan_decoder_layers(
+                    cfg,
+                    moe_layer,
+                    num_moe_layers,
+                    "moe_layers",
+                    mesh,
+                    in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
+                    model_mode=model_mode,
+                )(y, *broadcast_args)
         elif cfg.decoder_block == DecoderBlockType.GEMMA3:
           bidirectional_mask_value = multimodal_input.bidirectional_mask if multimodal_input is not None else None
           y = self._apply_gemma3_scanned_blocks(

@@ -434,6 +434,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       decoder_positions,
       deterministic,
       model_mode,
+      te_ep_layer_idx=None,  # scan xs index — positionally after model_mode, before previous_chunk
       previous_chunk=None,
       page_state: None | page_manager.PageState = None,
       slot: None | int = None,
@@ -599,15 +600,17 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       load_balance_loss = metadata["load_balance_loss"]
       moe_bias_updates = metadata["moe_bias_updates"]
     else:
-      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic)
+      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic,
+                                                                    te_ep_layer_idx=te_ep_layer_idx)
       layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout_op(layer_output, deterministic=deterministic)
 
     return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
 
-  def mlp_op(self, x, deterministic, *args, **kwargs):
+  def mlp_op(self, x, deterministic, *args, te_ep_layer_idx=None, **kwargs):
     mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
-        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding
+        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding,
+        te_ep_layer_idx=te_ep_layer_idx,
     )
     return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
 

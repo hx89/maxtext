@@ -541,6 +541,15 @@ class RoutedMoE(nnx.Module):
     else:
       self.per_expert_scale = None
 
+    # TE EP: create one EpHandle per MoE layer. Idempotent — safe to call on
+    # every nnx_wrappers construction (which re-runs __init__ on each apply).
+    if self.config.use_te_ep:
+      from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
+
+      self.ep_handles = te_ep_init.create_ep_handles()
+    else:
+      self.ep_handles = ()
+
   def _maybe_shard_with_logical(self, inputs, logical_name):
     return maybe_shard_with_logical(
         inputs,
@@ -1421,6 +1430,7 @@ class RoutedMoE(nnx.Module):
       w0_bias,
       w1_bias,
       wo_bias,
+      te_ep_layer_idx=None,
   ):
     """Perform sparse matrix multiplication of inputs and Experts."""
 
@@ -2032,7 +2042,7 @@ class RoutedMoE(nnx.Module):
 
       return output, lb_loss, bias_updates
 
-    def te_ep_wrapper(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs):
+    def te_ep_wrapper(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs, te_ep_layer_idx=None):
       """TE NCCL EP dispatch/combine path with MaxText expert compute.
 
       Unlike `wrapper` above this is NOT decorated with `jax.shard_map`. TE EP's
@@ -2087,16 +2097,39 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
-      # New TE API (PR #3036): ep_dispatch takes the per-layer handle first and
-      # returns (recv_tokens, recv_topk_weights, handle_mem, token_counts);
-      # the matching ep_combine takes both handle and handle_mem.
-      recv_tokens, recv_weights, handle_mem, token_counts = ep_dispatch(
-          state.ep_handle,
-          top_k_indices_2d,
-          x_2d,
-          weights_2d,
-          state.recv_capacity_per_rank,
-      )
+      # Per-layer handle selection via lax.switch.
+      # Each branch captures a distinct compile-time handle_id so TE EP does not
+      # alias HandleEntry state across layers under XLA's latency-hiding scheduler.
+      n_handles = len(self.ep_handles)
+      if n_handles == 0:
+        raise ValueError(
+            "self.ep_handles is empty — create_ep_handles() was not called. "
+            "Ensure init_te_ep_for_maxtext() ran before model creation."
+        )
+
+      def _make_dispatch_branch(handle):
+        def branch(args):
+          topk_idx, tokens, weights = args
+          return ep_dispatch(handle, topk_idx, tokens, weights, state.recv_capacity_per_rank)
+        return branch
+
+      dispatch_args = (top_k_indices_2d, x_2d, weights_2d)
+      if n_handles > 1:
+        if te_ep_layer_idx is None:
+          raise ValueError(
+              f"use_te_ep=True with {n_handles} MoE layers requires te_ep_layer_idx to be "
+              "threaded through the call chain (decoders.py → deepseek.py → RoutedMoE). "
+              "Got None — the scan xs wiring in decoders.py may be missing."
+          )
+        recv_tokens, recv_weights, handle_mem, token_counts = jax.lax.switch(
+            te_ep_layer_idx,
+            [_make_dispatch_branch(h) for h in self.ep_handles],
+            dispatch_args,
+        )
+      else:
+        recv_tokens, recv_weights, handle_mem, token_counts = ep_dispatch(
+            self.ep_handles[0], *dispatch_args
+        )
       recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
       recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
       token_counts = jax.lax.with_sharding_constraint(token_counts, ep_sharding_2d)
@@ -2237,19 +2270,25 @@ class RoutedMoE(nnx.Module):
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
-      # DEBUG: with fusion disabled in expert_compute, restore ep_combine's
-      # internal weighting by passing recv_weights (instead of None). Matches
-      # the OLD TE EP path that worked on job 1949999 — isolates whether NaN
-      # is from the new ep_make_handle/handle_mem API or the fusion math.
-      output = ep_combine(
-          state.ep_handle,
-          handle_mem,
-          token_counts,
-          expert_out,
-          recv_weights,
-          num_local_tokens,
-          out_sharding=tuple(state.input_spec_2d),
-      )
+      def _make_combine_branch(handle):
+        def branch(args):
+          hm, tc, eo, rw = args
+          return ep_combine(handle, hm, tc, eo, rw, num_local_tokens,
+                            out_sharding=tuple(state.input_spec_2d))
+        return branch
+
+      combine_args = (handle_mem, token_counts, expert_out, recv_weights)
+      if n_handles > 1:
+        output = jax.lax.switch(
+            te_ep_layer_idx,
+            [_make_combine_branch(h) for h in self.ep_handles],
+            combine_args,
+        )
+      else:
+        output = ep_combine(
+            self.ep_handles[0], handle_mem, token_counts, expert_out,
+            recv_weights, num_local_tokens, out_sharding=tuple(state.input_spec_2d),
+        )
       output = jax.lax.with_sharding_constraint(output, input_sharding)
       return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
 
@@ -2303,6 +2342,7 @@ class RoutedMoE(nnx.Module):
           w0_kernel, w1_kernel, wo_kernel,
           w0_bias, w1_bias, wo_bias,
           self.rngs,
+          te_ep_layer_idx=te_ep_layer_idx,
       )
 
     return wrapper(
@@ -2880,7 +2920,8 @@ class RoutedMoE(nnx.Module):
     return w0_kernel, w1_kernel, wo_kernel
 
   def __call__(
-      self, inputs: jax.Array, gate_inputs: jax.Array | None = None, out_sharding: NamedSharding | None = None
+      self, inputs: jax.Array, gate_inputs: jax.Array | None = None, out_sharding: NamedSharding | None = None,
+      te_ep_layer_idx=None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
@@ -2930,6 +2971,7 @@ class RoutedMoE(nnx.Module):
         )
       output, lb_loss, bias_updates = self.sparse_matmul(
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias,
+          te_ep_layer_idx=te_ep_layer_idx,
       )
     else:
       output, lb_loss, bias_updates = self.dense_matmul(
@@ -3020,9 +3062,10 @@ class RoutedAndSharedMoE(nnx.Module):
       gate_inputs: jax.Array | None = None,
       intermediate_sharding: NamedSharding | None = None,
       out_sharding: NamedSharding | None = None,
+      te_ep_layer_idx=None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(
-        inputs, gate_inputs=gate_inputs, out_sharding=out_sharding
+        inputs, gate_inputs=gate_inputs, out_sharding=out_sharding, te_ep_layer_idx=te_ep_layer_idx,
     )
     shared_experts = self.shared_experts(inputs, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding)
     return routed_experts + shared_experts, load_balance_loss, moe_bias_updates

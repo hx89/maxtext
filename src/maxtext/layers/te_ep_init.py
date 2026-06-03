@@ -39,7 +39,7 @@ plans/jax_hybridep/te_ep_recv_capacity_overflow.md):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any
 
@@ -72,7 +72,9 @@ class TeEpState:
   max_num_sms: int
   em_unfused_num_sms: int
   needs_v1_tail_absorb: bool
-  ep_handle: Any  # tex.EpHandle (opaque dataclass with handle_id/top_k/alignment).
+  top_k: int          # config.num_experts_per_tok — used by create_ep_handles()
+  num_moe_layers: int # num_decoder_layers - first_num_dense_layers
+  ep_handles: tuple   # one EpHandle per MoE layer; () until create_ep_handles() is called
   input_spec_2d: PartitionSpec
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
@@ -261,6 +263,8 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   dispatch_alignment = max(1, min_dispatch_alignment)
   needs_v1_tail_absorb = _needs_v1_tail_absorb()
 
+  num_moe_layers = int(config.num_decoder_layers) - int(config.first_num_dense_layers)
+
   leading_spec: Any = (outer_axis, _TE_EP_AXIS) if outer_axis is not None else _TE_EP_AXIS
   config_key = (
       _TE_EP_AXIS,
@@ -278,6 +282,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       int(config.te_ep_max_num_sms),
       int(config.te_ep_em_unfused_num_sms),
       needs_v1_tail_absorb,
+      num_moe_layers,
   )
 
   return TeEpState(
@@ -296,7 +301,9 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       max_num_sms=int(config.te_ep_max_num_sms),
       em_unfused_num_sms=int(config.te_ep_em_unfused_num_sms),
       needs_v1_tail_absorb=needs_v1_tail_absorb,
-      ep_handle=None,  # populated by init_te_ep_for_maxtext after ep_bootstrap
+      top_k=int(config.num_experts_per_tok),
+      num_moe_layers=num_moe_layers,
+      ep_handles=(),  # populated lazily by create_ep_handles() in RoutedMoE.__init__
       input_spec_2d=PartitionSpec(leading_spec, None),
       input_spec_3d=PartitionSpec(leading_spec, None, None),
       ep_spec_2d=PartitionSpec(leading_spec, None),
@@ -309,24 +316,33 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   """Bootstrap TE NCCL EP exactly once per process.
 
   Must be called before ``setup_train_loop`` — model creation traces
-  ``moe.py`` which dispatches into ``ep_dispatch``; the process-singleton
-  must be live by then. Idempotent for matching ``config_key``; raises on
-  shape/resource mismatch.
+  ``moe.py`` which calls ``create_ep_handles()``. Idempotent for matching
+  ``config_key``; raises on shape/resource mismatch.
+
+  EpHandles are NOT created here. They are created lazily and idempotently
+  in ``RoutedMoE.__init__`` via ``create_ep_handles()``, one per MoE layer.
   """
+  from maxtext.common.common_types import DecoderBlockType  # pylint: disable=import-outside-toplevel
+
   global _TE_EP_STATE
 
+  # Guard: only the normal scanned DeepSeek MoE path is wired for
+  # te_ep_layer_idx threading. Loosen guards as other paths are added.
   if not bool(getattr(config, "scan_layers", False)):
-    # We allocate exactly one EpHandle per process below. TE requires distinct
-    # EpHandles per physical MoE layer, but plumbing layer-indexed handles
-    # into moe.py is not implemented yet. Until that lands, refuse to bootstrap
-    # under unrolled stacks so the singleton handle isn't silently shared across
-    # multiple physical layers (which TE flags as undefined behaviour).
     raise ValueError(
-        "use_te_ep=True requires scan_layers=True. Unrolled MoE stacks would "
-        "share a single EpHandle across multiple physical layers, which TE's "
-        "ep_make_handle docstring forbids. Set scan_layers=true or wait for "
-        "per-physical-layer handle plumbing in moe.py."
+        "use_te_ep=True requires scan_layers=True. Unrolled MoE stacks need "
+        "separate per-layer handle plumbing that is not yet implemented."
     )
+  if getattr(config, "decoder_block", None) != DecoderBlockType.DEEPSEEK:
+    raise ValueError("use_te_ep=True currently only supports decoder_block=DEEPSEEK.")
+  if bool(getattr(config, "using_pipeline_parallelism", False)):
+    raise ValueError("use_te_ep=True does not support pipeline parallelism.")
+  if bool(getattr(config, "use_batch_split_schedule", False)):
+    raise ValueError("use_te_ep=True does not support use_batch_split_schedule.")
+  if getattr(config, "engram_layers", None):
+    raise ValueError("use_te_ep=True does not support engram_layers.")
+  if int(getattr(config, "mhc_expansion_rate", 1)) > 1:
+    raise ValueError("use_te_ep=True does not support mhc_expansion_rate > 1.")
 
   candidate = build_te_ep_state(config, mesh)
   if _TE_EP_STATE is not None:
@@ -346,18 +362,13 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         f"outer_axis={candidate.outer_axis}, ep_size={candidate.ep_size}."
     )
 
-  import dataclasses  # pylint: disable=import-outside-toplevel
-  from transformer_engine.jax.ep import ep_bootstrap, ep_make_handle  # pylint: disable=import-outside-toplevel
+  from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
   from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
   with mesh, jax.set_mesh(mesh), global_shard_guard(candidate.mesh_resource):
-    # Latest TE EP renamed em_unfused_num_sms -> max_num_permute_sms.
     # allow_handle_mem_reloc=True is required when XLA's CUSTOM_CALL is in the
     # command_buffer scope: XLA reallocates the EP handle_mem between captures
-    # and TE EP's get_or_open_handle() asserts unless reloc is allowed. Empirically
-    # both DSV3 671B at 20L (job 1924032, old formula) and 61L (job 1925466,
-    # new (NLE+1)*slots formula) hit the assertion without it — buffer size does
-    # not eliminate the reloc, only allowing it does.
+    # and TE EP's get_or_open_handle() asserts unless reloc is allowed.
     ep_bootstrap(
         world_size=world_size,
         rank=rank,
@@ -371,25 +382,16 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         allow_handle_mem_reloc=True,
     )
 
-  # Per-layer EP handle. With scan_layers=true the MoE wrapper is a single
-  # logical layer scanned over decoder depth — one handle is correct per TE's
-  # `ep_make_handle` docstring ("once per logical MoE layer"). If/when
-  # scan_layers=false (unrolled stack) lands, this needs to grow into a list
-  # of handles indexed by physical layer id.
-  ep_handle = ep_make_handle(
-      int(config.num_experts_per_tok),
-      dispatch_output_per_expert_alignment=candidate.dispatch_alignment,
-  )
-  _TE_EP_STATE = dataclasses.replace(candidate, ep_handle=ep_handle)
+  # EpHandles are created lazily in RoutedMoE.__init__ via create_ep_handles().
+  _TE_EP_STATE = candidate  # ep_handles=() until create_ep_handles() is called
   max_logging.log(
-      "TE EP initialized: "
+      "TE EP bootstrapped: "
       f"outer_axis={candidate.outer_axis}, ep_axis={candidate.ep_axis}, "
       f"ep_size={candidate.ep_size}, outer_size={candidate.outer_size}, "
+      f"num_moe_layers={candidate.num_moe_layers}, "
       f"max_tokens_per_rank={candidate.max_tokens_per_rank}, "
       f"recv_capacity_per_rank={candidate.recv_capacity_per_rank}, "
-      f"dispatch_alignment={candidate.dispatch_alignment}, "
-      f"max_num_sms={candidate.max_num_sms}, em_unfused_num_sms={candidate.em_unfused_num_sms}, "
-      f"ep_handle_id={getattr(ep_handle, 'handle_id', '?')}"
+      f"dispatch_alignment={candidate.dispatch_alignment}"
   )
   return _TE_EP_STATE
 
@@ -400,6 +402,50 @@ def get_te_ep_state() -> TeEpState:
         "TE EP has not been initialized. Call init_te_ep_for_maxtext(config, mesh) before tracing MoE."
     )
   return _TE_EP_STATE
+
+
+def _ep_make_handle(top_k: int, dispatch_output_per_expert_alignment: int) -> Any:
+  """Thin wrapper around ep_make_handle — stable module attribute for monkeypatching in tests."""
+  from transformer_engine.jax.ep import ep_make_handle  # pylint: disable=import-outside-toplevel
+
+  return ep_make_handle(top_k, dispatch_output_per_expert_alignment)
+
+
+def create_ep_handles() -> tuple:
+  """Create one EpHandle per MoE layer and cache in _TE_EP_STATE.ep_handles.
+
+  Idempotent: returns the cached tuple on all subsequent calls. Safe to call
+  from RoutedMoE.__init__ which is re-invoked on every nnx_wrappers apply call.
+  Requires init_te_ep_for_maxtext to have been called first (ep_bootstrap live).
+  All parameters come from _TE_EP_STATE — no config argument needed.
+  """
+  global _TE_EP_STATE
+  if _TE_EP_STATE is None:
+    raise ValueError(
+        "init_te_ep_for_maxtext must be called before create_ep_handles. "
+        "RoutedMoE.__init__ should not be reached before train.py bootstraps TE EP."
+    )
+  if _TE_EP_STATE.ep_handles:
+    return _TE_EP_STATE.ep_handles  # already created — return cached tuple
+  if _TE_EP_STATE.num_moe_layers <= 0:
+    raise ValueError(
+        f"num_moe_layers={_TE_EP_STATE.num_moe_layers}; check num_decoder_layers "
+        "and first_num_dense_layers in config."
+    )
+  handles = tuple(
+      _ep_make_handle(
+          _TE_EP_STATE.top_k,
+          dispatch_output_per_expert_alignment=_TE_EP_STATE.dispatch_alignment,
+      )
+      for _ in range(_TE_EP_STATE.num_moe_layers)
+  )
+  _TE_EP_STATE = replace(_TE_EP_STATE, ep_handles=handles)
+  handle_ids = [getattr(h, "handle_id", "?") for h in handles]
+  max_logging.log(
+      f"TE EP: created {_TE_EP_STATE.num_moe_layers} handles "
+      f"(ids {handle_ids[0]}..{handle_ids[-1]})"
+  )
+  return handles
 
 
 def reset_te_ep_state_for_test() -> None:
