@@ -195,6 +195,25 @@ def calculate_te_ep_capacity(
   return target
 
 
+def calculate_te_ep_padded_capacity_bound(
+    *,
+    max_tokens_per_rank: int,
+    ep_size: int,
+    top_k: int,
+    num_local_experts: int,
+    dispatch_alignment: int,
+) -> int:
+  """Worst-case ``sum(ceil(token_count / align) * align)`` for one recv rank."""
+  routed_token_bound = max(0, int(max_tokens_per_rank) * int(ep_size) * int(top_k))
+  if dispatch_alignment <= 0:
+    return routed_token_bound
+
+  align = int(dispatch_alignment)
+  active_local_experts = min(int(num_local_experts), routed_token_bound)
+  padded_bound = routed_token_bound + active_local_experts * (align - 1)
+  return math.ceil(padded_bound / align) * align
+
+
 def _max_tokens_per_rank(config: Any, leading_axis_size: int) -> int:
   global_tokens = int(config.micro_batch_size_to_train_on * config.max_target_length)
   return max(1, math.ceil(global_tokens / max(1, leading_axis_size)))
@@ -279,6 +298,27 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
     recv_capacity_per_rank = override_val
   else:
     recv_capacity_per_rank = derived_recv_capacity
+
+  # Static capacity sanity check. This is the true routing worst-case for the
+  # padded rows consumed by grouped GEMM. Keep this as a warning instead of a
+  # hard failure so reduced-capacity experiments remain possible; such runs can
+  # still underflow under sufficiently skewed routing.
+  worst_case_padded_capacity = calculate_te_ep_padded_capacity_bound(
+      max_tokens_per_rank=max_tokens_per_rank,
+      ep_size=ep_size,
+      top_k=int(config.num_experts_per_tok),
+      num_local_experts=num_local_experts,
+      dispatch_alignment=min_dispatch_alignment,
+  )
+  if recv_capacity_per_rank < worst_case_padded_capacity:
+    max_logging.log(
+        "TE EP: recv_capacity_per_rank="
+        f"{recv_capacity_per_rank} is below the worst-case padded receive "
+        f"bound {worst_case_padded_capacity}. This may underflow tail absorb "
+        "under routing skew; increase te_ep_recv_capacity_factor or "
+        "TE_EP_RECV_CAPACITY_PER_RANK for production runs."
+    )
+
   # dispatch_alignment is the *small* per-expert padding granularity (typically
   # 128 = moe_permutation_group_align_size). The recv buffer holds variable-sized
   # per-expert blocks of `ceil(token_counts[k] / dispatch_alignment) * dispatch_alignment`
