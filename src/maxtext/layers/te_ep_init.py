@@ -205,27 +205,27 @@ def _hidden_dim(config: Any) -> int:
 
 
 def _needs_v1_tail_absorb() -> bool:
-  """True when local GPUs use TE's V1 GroupedQuantizeFFI path for MXFP8.
+  """True when the MXFP8 GroupedQuantize path requires sum(group_sizes) == recv_capacity.
 
-  V1 enforces ``sum(group_sizes) == m || sum == input_dims[0]`` (see
-  ``transformer_engine/jax/csrc/extensions/quantization.cpp:385``). The V2
-  path used on sm_100+ (Blackwell) doesn't have this assertion. Our path-C1
-  variable-block layout has ``sum(padded_per_expert) < recv_capacity``, so
-  on sm_90 we must absorb the unused tail into the last expert's group to
-  satisfy the V1 assertion. On sm_100+ we skip tail-absorption to avoid the
-  ~17% perf cost (extra GMM rows + non-uniform group_sizes scheduling).
+  Both V1 and V2 MXFP8 grouped quantize/GEMM paths require
+  ``sum(group_sizes) == recv_capacity``:
+  - V1 (pre-sm_100, or old containers): explicit NVTE_CHECK assertion.
+  - V2 (sm_100+, TE >= commit 70af7305): no explicit assertion, but the kernel
+    reads exactly ``recv_capacity`` rows from the buffer; if sum(group_sizes) <
+    recv_capacity the remaining rows are read but not assigned to any expert →
+    wrong outputs.
+
+  Our path-C1 variable-block layout always has sum(padded) <= recv_capacity
+  (padded per-expert counts don't fill the buffer under typical load). We must
+  absorb the unused tail (recv_capacity - sum(padded)) into the last expert's
+  group to satisfy the invariant. The ~17% overhead from extra padded rows is
+  acceptable vs silent wrong results or an FFI crash.
+
+  Historical note: the original sm < 100 gating was based on the incorrect
+  assumption that the V2 path doesn't enforce this invariant. Container 0529
+  (TE >= 70af7305) introduced V2 MXFP8 GroupedQuantize and revealed the issue.
   """
-  try:
-    from transformer_engine.jax.cpp_extensions.misc import (  # pylint: disable=import-outside-toplevel
-        get_min_device_compute_capability,
-    )
-  except ImportError:
-    # If TE isn't importable here we can't be using TE EP either; safe default.
-    return False
-  try:
-    return int(get_min_device_compute_capability()) < 100
-  except Exception:  # noqa: BLE001 - resilient: any failure → safe default
-    return False
+  return True
 
 
 def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
