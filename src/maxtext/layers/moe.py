@@ -2100,6 +2100,13 @@ class RoutedMoE(nnx.Module):
       # Per-layer handle selection via lax.switch.
       # Each branch captures a distinct compile-time handle_id so TE EP does not
       # alias HandleEntry state across layers under XLA's latency-hiding scheduler.
+      # lax.switch reads branch_index on the compute stream; it must be replicated
+      # across all devices. On multi-node (DCN FSDP) meshes the scan xs scalar can
+      # land on an invalid shard — force full replication before the switch.
+      if te_ep_layer_idx is not None:
+        te_ep_layer_idx = jax.lax.with_sharding_constraint(
+            te_ep_layer_idx, NamedSharding(self.mesh, PartitionSpec())
+        )
       n_handles = len(self.ep_handles)
       if n_handles == 0:
         raise ValueError(
