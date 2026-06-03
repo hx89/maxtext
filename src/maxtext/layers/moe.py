@@ -2100,13 +2100,6 @@ class RoutedMoE(nnx.Module):
       # Per-layer handle selection via lax.switch.
       # Each branch captures a distinct compile-time handle_id so TE EP does not
       # alias HandleEntry state across layers under XLA's latency-hiding scheduler.
-      # lax.switch reads branch_index on the compute stream; it must be replicated
-      # across all devices. On multi-node (DCN FSDP) meshes the scan xs scalar can
-      # land on an invalid shard — force full replication before the switch.
-      if te_ep_layer_idx is not None:
-        te_ep_layer_idx = jax.lax.with_sharding_constraint(
-            te_ep_layer_idx, NamedSharding(self.mesh, PartitionSpec())
-        )
       n_handles = len(self.ep_handles)
       if n_handles == 0:
         raise ValueError(
@@ -2155,7 +2148,7 @@ class RoutedMoE(nnx.Module):
               w1_bias_pspec,
               wo_bias_pspec,
           ),
-          out_specs=(state.ep_spec_3d, state.ep_spec_2d),
+          out_specs=state.ep_spec_3d,
           check_vma=False,
       )
       def te_ep_expert_compute(recv_t, recv_w, tc, w0, w1, wo, w0_bias, w1_bias, wo_bias):
@@ -2272,11 +2265,9 @@ class RoutedMoE(nnx.Module):
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
         intermediate_output = jnp.where(active_mask[:, None], intermediate_output, jnp.zeros_like(intermediate_output))
-        # Return both expert output and sanitized recv_w so ep_combine uses
-        # clean weights (0 * NaN = NaN even for zero expert_out).
-        return intermediate_output.reshape(recv_t_local_shape), recv_w.reshape(recv_w_local_shape)
+        return intermediate_output.reshape(recv_t_local_shape)
 
-      expert_out, recv_weights_clean = te_ep_expert_compute(
+      expert_out = te_ep_expert_compute(
           recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
       )
       if expert_out.dtype != jnp.bfloat16:
@@ -2289,7 +2280,12 @@ class RoutedMoE(nnx.Module):
                             out_sharding=tuple(state.input_spec_2d))
         return branch
 
-      combine_args = (handle_mem, token_counts, expert_out, recv_weights_clean)
+      # Use original recv_weights for ep_combine. TE EP marks padded slots with
+      # recv_topk_weights==0 (ep.py:269). Absorbed tail rows are beyond sum(padded)
+      # and may not be explicitly zeroed by TE EP, but their recv_weights should be
+      # 0 since no tokens were dispatched there. ep_combine's _combine_fwd applies
+      # mask = (recv_topk_weights != 0) so tail rows produce zero output regardless.
+      combine_args = (handle_mem, token_counts, expert_out, recv_weights)
       if n_handles > 1:
         output = jax.lax.switch(
             te_ep_layer_idx,
@@ -2299,7 +2295,7 @@ class RoutedMoE(nnx.Module):
       else:
         output = ep_combine(
             self.ep_handles[0], handle_mem, token_counts, expert_out,
-            recv_weights_clean, num_local_tokens, out_sharding=tuple(state.input_spec_2d),
+            recv_weights, num_local_tokens, out_sharding=tuple(state.input_spec_2d),
         )
       output = jax.lax.with_sharding_constraint(output, input_sharding)
       return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
