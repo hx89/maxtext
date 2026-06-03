@@ -362,6 +362,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         f"outer_axis={candidate.outer_axis}, ep_size={candidate.ep_size}."
     )
 
+  import inspect  # pylint: disable=import-outside-toplevel
   from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
   from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
@@ -369,7 +370,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
     # allow_handle_mem_reloc=True is required when XLA's CUSTOM_CALL is in the
     # command_buffer scope: XLA reallocates the EP handle_mem between captures
     # and TE EP's get_or_open_handle() asserts unless reloc is allowed.
-    ep_bootstrap(
+    # max_num_permute_sms was renamed/dropped across TE versions; pass conditionally.
+    bootstrap_kwargs: dict = dict(
         world_size=world_size,
         rank=rank,
         ep_size=candidate.ep_size,
@@ -378,9 +380,11 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         recv_capacity_per_rank=candidate.recv_capacity_per_rank,
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
-        max_num_permute_sms=candidate.em_unfused_num_sms,
         allow_handle_mem_reloc=True,
     )
+    if "max_num_permute_sms" in inspect.signature(ep_bootstrap).parameters:
+      bootstrap_kwargs["max_num_permute_sms"] = candidate.em_unfused_num_sms
+    ep_bootstrap(**bootstrap_kwargs)
 
   # EpHandles are created lazily in RoutedMoE.__init__ via create_ep_handles().
   _TE_EP_STATE = candidate  # ep_handles=() until create_ep_handles() is called
