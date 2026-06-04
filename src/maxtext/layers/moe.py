@@ -2155,38 +2155,29 @@ class RoutedMoE(nnx.Module):
         # Per-shard shapes: recv_t [1, recv_capacity, H], recv_w [1, recv_capacity],
         # tc [1, NLE] actual token counts per local expert (un-padded).
         recv_t_local_shape = recv_t.shape
-        recv_w_local_shape = recv_w.shape
         recv_t = recv_t.reshape(state.recv_capacity_per_rank, -1)
         recv_w = recv_w.reshape(state.recv_capacity_per_rank)
         tc = tc.reshape(state.num_local_experts)
 
         # Per-expert padded counts: TE EP lays each expert's block back-to-back in the
         # recv buffer, each block sized `ceil(tc[k] / dispatch_alignment) * dispatch_alignment`
-        # rows. GMM consumer uses these as group_sizes.
+        # rows (mirrors HybridEP's `pad_multiple` layout). The GMM consumer uses these
+        # padded counts as `group_sizes` so per-expert reads land at the right offsets.
+        # Padded slots within each expert's block have `recv_w == 0` (masked downstream
+        # before ep_combine).
         align = jnp.int32(state.dispatch_alignment)
         padded = ((tc + align - 1) // align) * align
         if state.needs_v1_tail_absorb:
-          # Both V1 and V2 MXFP8 GroupedQuantize require sum(group_sizes)==recv_capacity.
-          # Absorb unused tail into the last expert's group.
+          # sm_90: TE's V1 GroupedQuantizeFFI fallback for MXFP8 asserts
+          # `sum(group_sizes) == m || sum == input_dims[0]`. Absorb the unused tail
+          # (recv_capacity − sum(padded)) into the last expert's group so the sum
+          # equals recv_capacity. The extra rows have `recv_w == 0` and produce
+          # masked-out zeros downstream. Adds ~17% GMM overhead but only path that
+          # works on Hopper. On Blackwell V2 path skips this assertion → no absorb.
           tail = jnp.int32(state.recv_capacity_per_rank) - padded.sum()
-          # tail should be non-negative for production-sized capacity. build_te_ep_state()
-          # logs when the configured capacity is below the static worst-case padded-row
-          # bound, but reduced-capacity experiments may still underflow under skewed
-          # routing. Do not add host callbacks here; this is the hot MoE path.
           group_sizes = padded.at[-1].add(tail)
         else:
           group_sizes = padded
-
-        # Sanitize recv_t and recv_w BEFORE any MXFP8 GMM. The absorbed tail rows
-        # contain uninitialized buffer data; MXFP8 amax is computed over ALL rows, so
-        # garbage in tail rows poisons FP8 scaling → NaN gradients on the next step.
-        # active_mask covers both per-expert padding slots (recv_w==0) and tail rows.
-        valid_rows = padded.sum()
-        row_mask = jnp.arange(state.recv_capacity_per_rank, dtype=jnp.int32) < valid_rows
-        active_mask = row_mask & (recv_w != 0)
-        recv_w = jnp.where(active_mask, recv_w, jnp.zeros_like(recv_w))
-        recv_t = jnp.where(active_mask[:, None], recv_t, jnp.zeros_like(recv_t))
-
         expert_indices = jnp.arange(state.num_local_experts, dtype=jnp.int32)
         selected_experts = jnp.repeat(
             expert_indices,
@@ -2257,14 +2248,20 @@ class RoutedMoE(nnx.Module):
           layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
 
         intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
-        # Sanitize intermediate_layer before wo GMM so MXFP8 amax stays clean.
-        intermediate_layer = jnp.where(active_mask[:, None], intermediate_layer, jnp.zeros_like(intermediate_layer))
+        # DEBUG: temporarily disable activation pre-weight fusion to isolate
+        # NaN cause between the new TE EP API (PR #3036) and the fusion math.
+        # The matching ep_combine still passes recv_w as recv_topk_weights so
+        # its internal weighted = expert_out * w * mask path is exercised
+        # (matches OLD TE EP path that worked at ~427 TFLOP/s on job 1949999).
         intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size, weight_gather_axes=wo_gather_axes)
         if self.config.mlp_bias:
           intermediate_output = intermediate_output + wo_bias
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
-        intermediate_output = jnp.where(active_mask[:, None], intermediate_output, jnp.zeros_like(intermediate_output))
+        # Padded slots are already zero after the pre-weight * recv_w (== 0)
+        # multiply, but mlp_bias contributes wo_bias * recv_w (also 0). Keep
+        # an explicit mask as a safety net.
+        intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
         return intermediate_output.reshape(recv_t_local_shape)
 
       expert_out = te_ep_expert_compute(
@@ -2280,11 +2277,6 @@ class RoutedMoE(nnx.Module):
                             out_sharding=tuple(state.input_spec_2d))
         return branch
 
-      # Use original recv_weights for ep_combine. TE EP marks padded slots with
-      # recv_topk_weights==0 (ep.py:269). Absorbed tail rows are beyond sum(padded)
-      # and may not be explicitly zeroed by TE EP, but their recv_weights should be
-      # 0 since no tokens were dispatched there. ep_combine's _combine_fwd applies
-      # mask = (recv_topk_weights != 0) so tail rows produce zero output regardless.
       combine_args = (handle_mem, token_counts, expert_out, recv_weights)
       if n_handles > 1:
         output = jax.lax.switch(
@@ -3180,3 +3172,4 @@ def get_routed_and_shared_moe(
       abstract_init=False,
   )
   return module
+
