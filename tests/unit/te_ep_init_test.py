@@ -115,6 +115,43 @@ class CalculateTeEpCapacityTest(unittest.TestCase):
     self.assertEqual(capacity, 128)
 
 
+class CalculateTeEpPaddedCapacityBoundTest(unittest.TestCase):
+  """Static bound for runtime padded token counts."""
+
+  def test_dsv3_671b_bs2_worst_case_bound(self):
+    capacity = te_ep_init.calculate_te_ep_padded_capacity_bound(
+        max_tokens_per_rank=8192,
+        ep_size=4,
+        top_k=8,
+        num_local_experts=64,
+        dispatch_alignment=128,
+    )
+    # Routed-token bound = 8192*4*8 = 262144. Padding overhead is at most
+    # 64*(128-1)=8128, then rounded up to alignment.
+    self.assertEqual(capacity, 270336)
+
+  def test_fewer_tokens_than_local_experts(self):
+    capacity = te_ep_init.calculate_te_ep_padded_capacity_bound(
+        max_tokens_per_rank=1,
+        ep_size=1,
+        top_k=1,
+        num_local_experts=8,
+        dispatch_alignment=128,
+    )
+    # Only one local expert can be active, so the padded bound is one block.
+    self.assertEqual(capacity, 128)
+
+  def test_unaligned(self):
+    capacity = te_ep_init.calculate_te_ep_padded_capacity_bound(
+        max_tokens_per_rank=4,
+        ep_size=4,
+        top_k=2,
+        num_local_experts=2,
+        dispatch_alignment=0,
+    )
+    self.assertEqual(capacity, 32)
+
+
 class ModuleSurfaceTest(unittest.TestCase):
   """Surface-level checks that don't require TE/JAX to be importable as GPU."""
 
