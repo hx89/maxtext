@@ -843,6 +843,10 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use TransformerEngine Grouped GEMM kernels for matmuls in MoE layers.",
   )
+  te_moe_block: bool = Field(
+      False,
+      description="Whether to use TransformerEngine's fused EP MoEBlock for routing, dispatch, grouped GEMM, and combine.",
+  )
   te_gmm_quantization: None | TEGroupedGemmQuantizationType = Field(
       TEGroupedGemmQuantizationType.EMPTY,
       description="Quantization mode for TE GMM matmuls, must be specified when te_use_gmm is true.",
