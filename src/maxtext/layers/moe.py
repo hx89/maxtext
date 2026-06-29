@@ -88,6 +88,10 @@ class RouteOutput:
   lb_loss: Optional[jax.Array]
   # Dynamic bias updates for loss-free load balancing, used only for Deepseek models
   bias_updates: Optional[jax.Array]
+  # HybridEP routing mask used by DeepEP combine.
+  hybrid_ep_routing_map: Optional[jax.Array] = None
+  # HybridEP per-dispatched-token routing probabilities.
+  hybrid_ep_dispatched_probs: Optional[jax.Array] = None
   # Shape [local experts], tracks number of local tokens routed to every local expert.
   local_group_sizes: Optional[jax.Array] = None
 
@@ -1495,8 +1499,60 @@ class RoutedMoE(nnx.Module):
       local_sorted_indices = None
       all_shards_group_sizes = None
       reshaped_group_sizes = None
+      hybrid_ep_routing_map = None
+      hybrid_ep_dispatched_probs = None
 
-      if self.config.use_ring_of_experts:
+      if self.config.use_hybrid_ep:
+        # DeepEP handles dispatch, all-to-all, and local permutation in one fused call.
+        from jax_deep_ep.autodiff import dispatch_differentiable
+        import jax_deep_ep.autodiff as hybridep_autodiff
+
+        num_tokens = x.shape[0] * x.shape[1]
+        num_experts = self.config.num_experts
+        num_local_experts = num_experts // num_ep
+
+        weights, selected_experts = self.get_topk(logits, pre_bias_logits, rngs, input_ids)
+
+        lb_loss = None
+        if self.config.load_balance_loss_weight > 0.0:
+          softmax_probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+          lb_loss = self.load_balance_loss(selected_experts, softmax_probs)
+
+        bias_updates = None
+        if self.should_update_load_balance():
+          bias_updates = calculate_load_balance_updates(
+              selected_experts, num_experts, self.config.routed_bias_update_rate
+          )
+
+        selected_experts_2d = selected_experts.reshape(num_tokens, -1)
+        routing_map = jnp.sum(jax.nn.one_hot(selected_experts_2d, num_classes=num_experts, dtype=jnp.int32), axis=1)
+        weights_2d = weights.reshape(num_tokens, -1)
+        dense_probs = jnp.zeros((num_tokens, num_experts), dtype=jnp.float32)
+        token_idx = jnp.broadcast_to(jnp.arange(num_tokens)[:, None], selected_experts_2d.shape)
+        dense_probs = dense_probs.at[token_idx, selected_experts_2d].set(weights_2d.astype(jnp.float32))
+
+        x_2d = x.reshape(num_tokens, -1)
+        if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
+          router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))
+          x_2d = x_2d * router_scores.reshape(num_tokens, -1)
+
+        hybridep_autodiff._pad_multiple = self.config.hybrid_ep_pad_multiple
+        hybridep_autodiff._use_ffi = True
+
+        hybrid_ep_routing_map = jax.lax.stop_gradient(routing_map.astype(jnp.bool_))
+        probs_stopped = jax.lax.stop_gradient(dense_probs.astype(jnp.float32))
+
+        x, tokens_per_expert, hybrid_ep_dispatched_probs = dispatch_differentiable(
+            x_2d, hybrid_ep_routing_map, probs_stopped
+        )
+        group_sizes = tokens_per_expert.astype(jnp.int32)
+        local_experts = jnp.arange(num_local_experts)
+        selected_experts = jnp.repeat(local_experts, repeats=group_sizes, total_repeat_length=x.shape[0])
+        sorted_selected_experts = selected_experts
+        weights = weights_2d
+        local_group_sizes = group_sizes
+
+      elif self.config.use_ring_of_experts:
         # The ring-of-experts strategy first duplicates the inputs to all
         # expert shards, and then routes within each shard.
 
@@ -1602,6 +1658,8 @@ class RoutedMoE(nnx.Module):
               weights=weights,
               lb_loss=lb_loss,
               bias_updates=bias_updates,
+              hybrid_ep_routing_map=hybrid_ep_routing_map,
+              hybrid_ep_dispatched_probs=hybrid_ep_dispatched_probs,
               local_group_sizes=local_group_sizes,
           ),
           RouteMetadata(
@@ -1830,6 +1888,23 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         intermediate_output = intermediate_output + wo_bias
       intermediate_output = adc.checkpoint_name(adc.checkpoint_name(intermediate_output, "mlpwo"), "moe_mlpwo")
+
+      if self.config.use_hybrid_ep:
+        from jax_deep_ep.autodiff import combine_differentiable
+
+        if routing.hybrid_ep_routing_map is None or routing.hybrid_ep_dispatched_probs is None:
+          raise ValueError("HybridEP routing state was not initialized.")
+
+        if self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4:
+          intermediate_output = (
+              intermediate_output * routing.hybrid_ep_dispatched_probs[: intermediate_output.shape[0], None]
+          ).astype(jnp.bfloat16)
+
+        if intermediate_output.dtype != jnp.bfloat16:
+          intermediate_output = intermediate_output.astype(jnp.bfloat16)
+        output = combine_differentiable(intermediate_output, routing.hybrid_ep_routing_map)
+        output = output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
+        return output, routing.lb_loss, routing.bias_updates
 
       if self.config.use_ring_of_experts:
         # Unsort and deduplicate the outputs locally.

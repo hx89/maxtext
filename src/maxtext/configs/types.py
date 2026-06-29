@@ -772,6 +772,21 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
   )
+  use_hybrid_ep: bool = Field(
+      False,
+      description="Whether to use DeepEP hybridEP for MoE dispatch/combine (NVLink domain, GPU only).",
+  )
+  hybrid_ep_pad_multiple: int = Field(
+      128,
+      description=(
+          "Padding alignment for hybridEP expert GEMMs. DeepEP pads each expert's tokens to this multiple. "
+          "Must be 128 for te_mxfp8."
+      ),
+  )
+  forward_pass_only: bool = Field(
+      False,
+      description="Skip gradient computation in train_step. Forward pass only with dummy zero gradients.",
+  )
   moe_dispatch_no_expert_sharding: bool = Field(
       False,
       description=(
@@ -1129,6 +1144,12 @@ class RematAndOffload(BaseModel):
   moe_mlpwo: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for the second MoE layer's output.",
+  )
+  moe_dispatch: RematLocation = Field(
+      RematLocation.REMAT,
+      description=(
+          "Remat policy for HybridEP dispatch output. Set to 'device' to avoid remat re-execution of dispatch FFI."
+      ),
   )
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
@@ -2893,6 +2914,7 @@ class MaxTextConfig(
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
+          "moe_dispatch",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",

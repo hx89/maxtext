@@ -378,16 +378,28 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       pure_params = params["params"] if sparsity_enabled else params
       batch_stats = params.get("batch_stats", {})
 
-      grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
-      (loss, aux), raw_grads = grad_func(
-          model,
-          config,
-          data,
-          dropout_rng,
-          pure_params,
-          sparsity_state=batch_stats,
-          is_train=True,
-      )
+      if getattr(config, "forward_pass_only", False):
+        loss, aux = loss_fn(
+            model,
+            config,
+            data,
+            dropout_rng,
+            pure_params,
+            sparsity_state=batch_stats,
+            is_train=True,
+        )
+        raw_grads = jax.tree.map(jnp.zeros_like, pure_params)
+      else:
+        grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
+        (loss, aux), raw_grads = grad_func(
+            model,
+            config,
+            data,
+            dropout_rng,
+            pure_params,
+            sparsity_state=batch_stats,
+            is_train=True,
+        )
     else:
       owg_type = variablelib.variable_type_from_name("_overwrite_with_gradient", allow_register=True)
       custom_param_filter = nnx.Any(owg_type)
@@ -745,6 +757,15 @@ def training_loop_iteration(
 
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
+  # Initialize before setup_train_loop because model creation can trace HybridEP dispatch FFI.
+  if config.use_hybrid_ep:
+    import jax_deep_ep
+    from jax_deep_ep.ffi_ops import set_buffer_manager as ffi_set_buffer_manager
+
+    mgr = jax_deep_ep.init(maxtext_config=config)
+    ffi_set_buffer_manager(mgr)
+    max_logging.log("HybridEP buffer manager initialized")
+
   (
       init_rng,
       checkpoint_manager,
