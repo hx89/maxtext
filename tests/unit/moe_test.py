@@ -1615,6 +1615,72 @@ def test_remove_expert_from_partition_spec():
   assert remove_expert_from_partition_spec(spec(("expert",), None), dims_to_peel=(0, 1)) == spec(None, None)
 
 
+def test_shard_exp_on_fsdp_uses_ordered_ep_fsdp_storage_and_ep_compute_axes():
+  """Expert FSDP stores E over ordered EP x FSDP, then gathers only FSDP for GMM."""
+  cfg = pyconfig.initialize(
+      [None, get_test_config_path()],
+      run_name="expert_fsdp_axes",
+      enable_checkpointing=False,
+      model_name="mixtral-8x7b",
+      num_experts=8,
+      ici_expert_parallelism=2,
+      ici_fsdp_parallelism=2,
+      dcn_expert_parallelism=1,
+      dcn_fsdp_parallelism=1,
+      shard_exp_on_fsdp=True,
+  )
+
+  wi_storage_axes, wo_storage_axes = moe.get_expert_fsdp_storage_kernel_axes()
+  wi_compute_axes, wo_compute_axes = moe.get_expert_parallel_compute_kernel_axes()
+  assert wi_storage_axes[0] == "exp_with_fsdp"
+  assert wo_storage_axes[0] == "exp_with_fsdp"
+  assert wi_compute_axes[0] == "exp"
+  assert wo_compute_axes[0] == "exp"
+
+  wi_storage_spec = nn_partitioning.logical_to_mesh_axes(wi_storage_axes, rules=cfg.logical_axis_rules)
+  wo_storage_spec = nn_partitioning.logical_to_mesh_axes(wo_storage_axes, rules=cfg.logical_axis_rules)
+  wi_compute_spec = nn_partitioning.logical_to_mesh_axes(wi_compute_axes, rules=cfg.logical_axis_rules)
+  wo_compute_spec = nn_partitioning.logical_to_mesh_axes(wo_compute_axes, rules=cfg.logical_axis_rules)
+
+  assert wi_storage_spec[0] == ("expert", "fsdp")
+  assert wo_storage_spec[0] == ("expert", "fsdp")
+  assert wi_compute_spec[0] == "expert"
+  assert wo_compute_spec[0] == "expert"
+
+
+def test_shard_exp_on_fsdp_requires_expert_fsdp_divisibility():
+  with pytest.raises(ValueError, match=r"num_experts.*expert_parallelism \* fsdp_parallelism"):
+    pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="expert_fsdp_bad_divisibility",
+        enable_checkpointing=False,
+        model_name="mixtral-8x7b",
+        num_experts=10,
+        ici_expert_parallelism=2,
+        ici_fsdp_parallelism=2,
+        dcn_expert_parallelism=1,
+        dcn_fsdp_parallelism=1,
+        shard_exp_on_fsdp=True,
+    )
+
+
+def test_shard_exp_on_fsdp_rejects_tensor_parallelism():
+  with pytest.raises(ValueError, match="does not yet support tensor parallelism"):
+    pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="expert_fsdp_with_tp",
+        enable_checkpointing=False,
+        model_name="mixtral-8x7b",
+        num_experts=8,
+        ici_expert_parallelism=2,
+        ici_fsdp_parallelism=2,
+        ici_tensor_parallelism=2,
+        dcn_expert_parallelism=1,
+        dcn_fsdp_parallelism=1,
+        shard_exp_on_fsdp=True,
+    )
+
+
 def test_moe_dispatch_no_expert_sharding_dense_forward():
   """The moe_dispatch_no_expert_sharding peel path runs in dense_matmul (capacity_factor>0)."""
   cfg = pyconfig.initialize(

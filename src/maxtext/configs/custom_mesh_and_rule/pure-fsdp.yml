@@ -30,5 +30,7 @@ logical_axis_rules: [
                       ['embed_moe', ['fsdp']],
                       ['q_lora', ['fsdp']],
                       ['kv_lora', ['fsdp']],
+                      # This custom mesh intentionally has no expert axis; EP=1 collapses
+                      # the ordered expert x FSDP storage layout to FSDP only.
                       ['exp_with_fsdp', 'fsdp'],
                     ]

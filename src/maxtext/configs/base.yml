@@ -266,8 +266,9 @@ norm_topk_prob: false # boolean to enable the top-k probability normalization. q
 
 # when moe weight matrices are sharded on both fsdp and fsdp-transpose axes, use two separate all-gather calls
 moe_fsdp_use_two_stage_all_gather: false
-# Shard the expert dimension of the MLP weights on the FSDP axis.
-# This configuration is recommended only when num_experts is a multiple of fsdp_parallelism
+# Shard the expert dimension of routed MLP weights on the ordered expert x FSDP axes.
+# The routed GEMM keeps expert sharding and gathers only FSDP. num_experts must be
+# divisible by expert_parallelism * fsdp_parallelism.
 shard_exp_on_fsdp: false
 # use fsdp and fsdp_transpose axes for sharding the moe weights
 use_2d_fsdp_sharding: false
@@ -554,6 +555,7 @@ logical_axis_rules: [
                       ['activation_exp', ['expert']],
                       # MoE Weights
                       ['exp', 'expert'],
+                      ['exp_with_fsdp', ['expert', 'fsdp']],
                       ['mlp_moe', ['fsdp_transpose', 'tensor', 'tensor_sequence', 'autoregressive']],
                       ['embed_moe', ['fsdp', 'fsdp_transpose', 'tensor_transpose', 'context']],
                       ['embed_moe', ['fsdp', 'tensor_transpose', 'context']],
@@ -610,7 +612,6 @@ logical_axis_rules: [
                       # ==========================================
                       ['mlp_no_fsdp', ['tensor', 'tensor_sequence', 'autoregressive']],
                       ['embed_tensor_transpose', ['tensor_transpose']],
-                      ['exp_with_fsdp', 'fsdp'],
                   ]
 # Axes used for DCN must be earlier in this list than ICI, see (b/339009148) for details
 data_sharding: [['data', 'stage', 'fsdp', 'fsdp_transpose', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']]

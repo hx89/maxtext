@@ -109,7 +109,7 @@ Dropping:
 
 `moe_fsdp_use_two_stage_all_gather`: If enabled, split the All-Gather operation for MoE weights into two separate stages when using FSDP/FSDP-transpose sharding. This is preferred when 3D All-Gather support is unavailable.
 
-`shard_exp_on_fsdp`: If enabled, shard the expert dimension of the MLP weights on the FSDP axis, and recommended only when num_experts is a multiple of fsdp_parallelism.
+`shard_exp_on_fsdp`: If enabled, persist routed MLP weights with their expert dimension sharded over the ordered product of the expert and FSDP mesh axes. Routed GEMM compute retains expert sharding and gathers only the FSDP part, so each rank computes with its EP-local experts while storing only `num_experts / (expert_parallelism * fsdp_parallelism)` complete expert matrices. `num_experts` must be divisible by `expert_parallelism * fsdp_parallelism`. Tensor/autoregressive parallelism, 2D FSDP, and two-stage MoE FSDP gathering are not yet supported in this mode.
 
 ## 3. Performance Tuning
 

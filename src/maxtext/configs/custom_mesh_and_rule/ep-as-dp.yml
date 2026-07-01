@@ -59,6 +59,7 @@ logical_axis_rules: [
                       ['activation_exp', ['expert']],
                       # MoE Weights
                       ['exp', 'expert'],
+                      ['exp_with_fsdp', ['expert', 'fsdp']],
                       ['mlp_moe', ['fsdp_transpose']],
                       ['embed_moe', ['fsdp']],
                       # ==========================================
@@ -76,8 +77,4 @@ logical_axis_rules: [
                       ['mlp', ['fsdp_transpose']],
                       ['embed', ['fsdp', 'fsdp_transpose']],
                       ['embed', ['fsdp']],
-                      # ==========================================
-                      # Deprecated / Scheduled for Removal
-                      # ==========================================
-                      ['exp_with_fsdp', 'fsdp'],
                   ]

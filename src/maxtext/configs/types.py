@@ -839,8 +839,8 @@ class MoEGeneral(BaseModel):
   )
   shard_exp_on_fsdp: bool = Field(
       False,
-      description="Shard the expert dimension of the MLP weights on the FSDP axis, "
-      "and recommended only when num_experts is a multiple of fsdp_parallelism",
+      description="Shard routed MLP weights on the ordered expert x FSDP axes persistently, then gather only "
+      "FSDP for routed GEMM compute. Requires num_experts to be divisible by expert_parallelism * fsdp_parallelism.",
   )
   use_2d_fsdp_sharding: bool = Field(
       False,
@@ -3268,6 +3268,37 @@ class MaxTextConfig(
       )
     if self.hardware == "gpu" and self.packing and self.attention == "cudnn_flash_te" and self.max_segments_per_seq <= 0:
       raise ValueError("max_segments_per_seq must be set when using TransformerEngine attention and packing")
+    if self.shard_exp_on_fsdp:
+      expert_parallelism = self.ici_expert_parallelism * self.dcn_expert_parallelism
+      fsdp_parallelism = self.ici_fsdp_parallelism * self.dcn_fsdp_parallelism
+      if expert_parallelism <= 0 or fsdp_parallelism <= 0:
+        raise ValueError(
+            "shard_exp_on_fsdp requires explicit positive expert and FSDP parallelism values; auto (-1) is unsupported."
+        )
+      expert_fsdp_parallelism = expert_parallelism * fsdp_parallelism
+      if self.num_experts % expert_fsdp_parallelism != 0:
+        raise ValueError(
+            "shard_exp_on_fsdp requires num_experts to be divisible by expert_parallelism * fsdp_parallelism; "
+            f"got num_experts={self.num_experts}, expert_parallelism={expert_parallelism}, "
+            f"fsdp_parallelism={fsdp_parallelism}."
+        )
+      if self.use_2d_fsdp_sharding or self.moe_fsdp_use_two_stage_all_gather:
+        raise ValueError(
+            "shard_exp_on_fsdp is incompatible with use_2d_fsdp_sharding and moe_fsdp_use_two_stage_all_gather."
+        )
+      tensor_parallelism = (
+          self.ici_tensor_parallelism
+          * self.dcn_tensor_parallelism
+          * self.ici_tensor_transpose_parallelism
+          * self.dcn_tensor_transpose_parallelism
+          * self.ici_tensor_sequence_parallelism
+          * self.dcn_tensor_sequence_parallelism
+      )
+      if tensor_parallelism != 1:
+        raise ValueError("shard_exp_on_fsdp does not yet support tensor parallelism.")
+      autoregressive_parallelism = self.ici_autoregressive_parallelism * self.dcn_autoregressive_parallelism
+      if autoregressive_parallelism != 1:
+        raise ValueError("shard_exp_on_fsdp does not yet support autoregressive parallelism.")
     dcn_product = (
         self.dcn_data_parallelism
         * self.dcn_pipeline_parallelism

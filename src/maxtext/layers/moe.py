@@ -154,6 +154,22 @@ def get_batchsplit_init_kernel_axes():
   )
 
 
+def get_expert_fsdp_storage_kernel_axes():
+  """Logical axes for complete expert matrices sharded over ordered EP x FSDP."""
+  return (
+      ("exp_with_fsdp", "embed_tensor_transpose", "mlp_no_fsdp"),
+      ("exp_with_fsdp", "mlp_no_fsdp", "embed_tensor_transpose"),
+  )
+
+
+def get_expert_parallel_compute_kernel_axes():
+  """Logical axes after gathering the FSDP part of expert storage."""
+  return (
+      ("exp", "embed_tensor_transpose", "mlp_no_fsdp"),
+      ("exp", "mlp_no_fsdp", "embed_tensor_transpose"),
+  )
+
+
 def random_routing(rng_key, gate_logits, num_experts_per_tok):
   """Performs random routing of tokens to experts.
 
@@ -422,9 +438,9 @@ class RoutedMoE(nnx.Module):
     )
 
     if self.config.shard_exp_on_fsdp:
-      # special sharding for dsv3
-      self.wi_kernel_axes = ("embed_moe", None, "mlp_moe")
-      self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
+      # Persist complete expert matrices on the ordered expert x FSDP axes.
+      # Routed GEMM compute gathers only FSDP and retains expert sharding.
+      self.wi_kernel_axes, self.wo_kernel_axes = get_expert_fsdp_storage_kernel_axes()
     elif self.config.use_2d_fsdp_sharding:
       self.wi_kernel_axes = ("embed_moe", "mlp_moe", None)
       self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
@@ -571,8 +587,9 @@ class RoutedMoE(nnx.Module):
       )
 
     if self.config.mlp_bias:
-      wi_bias_axes = ("exp", "activation_mlp")
-      wo_bias_axes = ("exp", "activation_embed")
+      bias_expert_axis = "exp_with_fsdp" if self.config.shard_exp_on_fsdp else "exp"
+      wi_bias_axes = (bias_expert_axis, "activation_mlp")
+      wo_bias_axes = (bias_expert_axis, "activation_embed")
       wi_bias_shape = (self.num_experts, self.intermediate_dim)
       wo_bias_shape = (self.num_experts, self.moe_expert_input_dim)
       self.wi_0_bias = nnx.Param(
@@ -1442,15 +1459,17 @@ class RoutedMoE(nnx.Module):
       if self.config.shard_exp_on_fsdp:
         quantization_rule = qpl.get_current_rule("gmm")
         if quantization_rule and quantization_rule.weight_calibration_method.startswith("fixed"):
-          # special sharding when using static scaling for weights in quantization with shard_exp_on_fsdp
+          # Fixed quantization gathers inside the GMM so its QTensor scales remain aligned.
+          # Keep the storage pspec here; get_active_sharding_axes filters out EP so the
+          # custom GMM gathers only the FSDP part of the expert dimension.
           w0_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
           w1_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
           wo_pspec = self._logical_to_mesh_axes(self.wo_kernel_axes)
         else:
-          # special sharding for dsv3 to remove overhead between gmm/AG
-          w0_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", None, "mlp_no_fsdp"))
-          w1_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", None, "mlp_no_fsdp"))
-          wo_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", "mlp_no_fsdp", None))
+          wi_compute_axes, wo_compute_axes = get_expert_parallel_compute_kernel_axes()
+          w0_pspec = self._logical_to_mesh_axes(wi_compute_axes)
+          w1_pspec = self._logical_to_mesh_axes(wi_compute_axes)
+          wo_pspec = self._logical_to_mesh_axes(wo_compute_axes)
       elif self.config.use_2d_fsdp_sharding:
         w0_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", "mlp_no_fsdp", None))
         w1_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", "mlp_no_fsdp", None))
@@ -1675,7 +1694,16 @@ class RoutedMoE(nnx.Module):
         return []
       axes = (pspec_dim_axes,) if isinstance(pspec_dim_axes, str) else pspec_dim_axes
       active = []
+      expert_mesh_axes = (
+          (self._expert_parallelism_name,)
+          if isinstance(self._expert_parallelism_name, str)
+          else self._expert_parallelism_name
+      )
       for ax in axes:
+        if self.config.shard_exp_on_fsdp and ax in expert_mesh_axes:
+          # EP is already local to the routed GMM. Only the FSDP part of the
+          # persistent expert shard is materialized by the custom GMM gather.
+          continue
         if ax and self.mesh.shape.get(ax, 1) > 1:
           active.append((ax, tensor_dim_index))
       return active
