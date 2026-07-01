@@ -201,7 +201,6 @@ mtp_loss_scaling_factor: 0.1
 # first auxiliary prediction head. set to 0 to disable this specific evaluation
 mtp_eval_target_module: 0
 
-
 # mixture of experts (moe)
 num_experts: 1
 num_experts_per_tok: 1
@@ -229,6 +228,11 @@ moe_dispatch_no_expert_sharding: false
 use_ragged_sort: false # whether to use the Pallas ragged-sort kernels in the MoE permute path; valid both with and
                        # without `use_ring_of_experts` (with EP > 1). When `use_ring_of_experts=True` the kernels run
                        # inside `permute`/`unpermute`; otherwise they run inside `local_permute`/local-unpermute.
+te_router_and_permutation_impl: false # whether to use TransformerEngine fused router and permutation kernels for MoE routing and token dispatch/combine
+moe_permutation_group_align_size: 128 # alignment size for MoE permutation group padding (MT and TE paths), set to 0 to disable
+te_use_gmm: false # whether to use the TE GMM implementation for MoE matmuls
+te_moe_block: false # whether to use TransformerEngine's fused EP MoEBlock for routed MoE layers
+te_gmm_quantization: "" # quantization mode for TE GMM matmuls, must be specified when te_use_gmm is true.
 use_gather_mosaic_kernel: false # whether to use a custom mosaic kernel for token gather ops
 ragged_gather_fallback: false # when true, unconditionally use the JAX reference implementation instead of the
                               # ragged gather SparseCore kernel. When false (default), use the SparseCore kernel.

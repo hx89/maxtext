@@ -965,7 +965,7 @@ class TransformerEngineQuantization(Quantization):
     from transformer_engine.common import recipe  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
     RECIPES = {
-        "te_no_quant": lambda: None, 
+        "te_no_quant": lambda: None,
         "te_fp8_delayedscaling": recipe.DelayedScaling,
         "te_fp8_currentscaling": recipe.Float8CurrentScaling,
         "te_mxfp8": recipe.MXFP8BlockScaling,
@@ -1082,7 +1082,7 @@ class TransformerEngineQuantization(Quantization):
     }
     if te_gmm_quantization_recipe_name not in ALIGN_SIZES_BY_RECIPE_NAME:
       raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
-    return ALIGN_SIZES_BY_RECIPE_NAME[te_gmm_quantization_recipe_name] 
+    return ALIGN_SIZES_BY_RECIPE_NAME[te_gmm_quantization_recipe_name]
 
   def get_gmm_quantizer_set(self, te_gmm_quantization_recipe_name: str, n_groups: int):
     """Create a TransformerEngine quantizer set for direct grouped GEMM calls."""

@@ -839,6 +839,14 @@ class MoEGeneral(BaseModel):
       description="Bytes-accessed cost estimate override for the ragged gather reduce kernel. "
       "-1 means auto-compute, any > 0 value overrides the bytes_accessed cost estimate.",
   )
+  te_router_and_permutation_impl: bool = Field(
+      False,
+      description="Whether to use TransformerEngine fused router and permutation kernels for MoE routing and token dispatch/combine.",
+  )
+  moe_permutation_group_align_size: int = Field(
+      128,
+      description="Alignment size for MoE permutation group padding (MT and TE paths). Set to 0 to disable.",
+  )
   te_use_gmm: bool = Field(
       False,
       description="Whether to use TransformerEngine Grouped GEMM kernels for matmuls in MoE layers.",
@@ -3203,6 +3211,16 @@ class MaxTextConfig(
         raise ValueError("GPT-OSS MoE only supports dropless (capacity_factor=-1) with dense matmul.")
       if self.routed_bias and self.routed_bias_update_rate > 0.0 and self.decoder_block != DecoderBlockType.DEEPSEEK:
         raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
+      if self.te_router_and_permutation_impl and not self.sparse_matmul:
+        raise ValueError("te_router_and_permutation_impl=True requires sparse_matmul=True.")
+      if self.te_use_gmm and not self.sparse_matmul:
+        raise ValueError("te_use_gmm=True requires sparse_matmul=True.")
+      if self.te_moe_block and not self.sparse_matmul:
+        raise ValueError("te_moe_block=True requires sparse_matmul=True.")
+      if self.te_moe_block and self.routed_bias_update_rate > 0.0:
+        raise ValueError("te_moe_block=True does not currently support routed_bias_update_rate > 0.")
+      if self.te_use_gmm and self.te_gmm_quantization == TEGroupedGemmQuantizationType.EMPTY:
+        raise ValueError("te_gmm_quantization must be specified when te_use_gmm is True.")
       if self.model_name.startswith("deepseek4") and self.first_num_hash_layers > 0 and self.use_ring_of_experts:
         raise ValueError("DeepSeek V4 hash routing is currently not supported with ring of experts.")
       self.validate_ragged_buffer_factor()

@@ -39,6 +39,8 @@ from maxtext.kernels.ragged.ragged_sort import a2a_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_unsort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import ring_ragged_unsort
+from maxtext.layers import te_permutation
+from maxtext.layers import te_router
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
@@ -55,6 +57,23 @@ set_xla_metadata = xla_metadata.set_xla_metadata
 
 DISPATCH = "dispatch"
 COMBINE = "combine"
+
+
+class PermState:
+  """Implementation-specific state shared by MoE permute and unpermute."""
+
+  def __init__(self, use_te: bool):
+    self.use_te = use_te
+    self.row_id_map = None
+    self.dense_probs = None
+    self.pad_offsets = None
+    self.sorted_selected_experts = None
+    self.weights = None
+    self.sorted_split_sizes = None
+    self.inverse_chunk_indices = None
+    self.local_sorted_indices = None
+    self.local_group_sizes = None
+    self.all_shards_tokens_per_expert = None
 
 
 @struct.dataclass
@@ -94,6 +113,8 @@ class RouteOutput:
   hybrid_ep_dispatched_probs: Optional[jax.Array] = None
   # Shape [local experts], tracks number of local tokens routed to every local expert.
   local_group_sizes: Optional[jax.Array] = None
+  # Backend-specific permutation state for the standard MT or TE path.
+  perm_state: Optional[PermState] = None
 
 
 def _sort_activations(
@@ -316,7 +337,12 @@ class GateLogit(nnx.Module):
       return None
     return getattr(self, self._quant_dot_general_name)
 
-  def __call__(self, inputs: jax.Array, _initializing: bool = False) -> Tuple[jax.Array, Optional[jax.Array]]:
+  def __call__(
+      self,
+      inputs: jax.Array,
+      _initializing: bool = False,
+      return_raw_logits: bool = False,
+  ) -> Tuple[jax.Array, Optional[jax.Array]]:
     inputs = jnp.asarray(inputs, self.dtype)
     norm_axis = linears.normalize_axes(self.axis, inputs.ndim)
 
@@ -813,7 +839,7 @@ class RoutedMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
       return intermediate_layer.astype(self.dtype)
 
-  def permute(
+  def _mt_permute(
       self,
       inputs,
       gate_logits,
@@ -839,8 +865,6 @@ class RoutedMoE(nnx.Module):
       bias_updates = calculate_load_balance_updates(
           selected_experts, self.config.num_experts, self.config.routed_bias_update_rate
       )
-
-    weights, selected_experts = self.get_topk(gate_logits, pre_bias_logits, rngs)
 
     tokens_per_expert = jnp.bincount(selected_experts.ravel(), length=self.num_experts)
     align_size = self.config.moe_permutation_group_align_size
@@ -868,17 +892,6 @@ class RoutedMoE(nnx.Module):
           offset_in_slot < padding_needed,
           expert_for_pos,
           self.num_experts - 1,
-      )
-
-    lb_loss = None
-    if self.config.load_balance_loss_weight > 0.0:
-      softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
-      lb_loss = self.load_balance_loss(selected_experts, softmax_probs)
-
-    bias_updates = None
-    if self.should_update_load_balance():
-      bias_updates = calculate_load_balance_updates(
-          selected_experts, self.config.num_experts, self.config.routed_bias_update_rate
       )
 
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
@@ -929,16 +942,31 @@ class RoutedMoE(nnx.Module):
       )
     else:
       flatten_selected_experts = jnp.ravel(selected_experts)
-
+      if align_size > 0:
+        flatten_selected_experts = jnp.concatenate(
+            [flatten_selected_experts, flatten_padding_selected_experts], axis=0
+        )
       if roll_to_expert_id is not None:
         flatten_selected_experts = (flatten_selected_experts - roll_to_expert_id) % self.num_experts
       sorted_selected_experts = jnp.argsort(flatten_selected_experts)
       # sort inputs for number of selected experts
       replicated_inputs_2d = jnp.repeat(inputs_2d, self.num_experts_per_tok, axis=0)
+      if align_size > 0:
+        replicated_inputs_2d = jnp.pad(
+            replicated_inputs_2d,
+            pad_width=((0, flatten_padding_selected_experts.size), (0, 0)),
+            mode="constant",
+            constant_values=0.0,
+        )
       sorted_inputs = _sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(
           self.dtype
       )
-      group_size = jnp.bincount(flatten_selected_experts, length=self.num_experts)
+      if align_size > 0:
+        group_size = tokens_per_expert + padding_tokens_per_expert
+      else:
+        group_size = tokens_per_expert
+      if roll_to_expert_id is not None:
+        group_size = jnp.roll(group_size, -roll_to_expert_id)
 
     num_tokens = bsz_times_seq_len * self.num_experts_per_tok
     use_truncated_buffer = use_ragged_in_permute and buffer_size is not None and buffer_size < num_tokens
@@ -961,12 +989,15 @@ class RoutedMoE(nnx.Module):
       )
     else:
       local_group_size = None
-      expert_indices = jnp.arange(self.num_experts)
-      sorted_experts = jnp.repeat(
-          expert_indices,
-          repeats=group_size,
-          total_repeat_length=math.prod(selected_experts.shape),
-      )
+      if use_ragged_in_permute:
+        expert_indices = jnp.arange(self.num_experts)
+        sorted_experts = jnp.repeat(
+            expert_indices,
+            repeats=group_size,
+            total_repeat_length=math.prod(selected_experts.shape),
+        )
+      else:
+        sorted_experts = flatten_selected_experts[sorted_selected_experts]
 
     return (
         sorted_inputs,
@@ -1058,6 +1089,9 @@ class RoutedMoE(nnx.Module):
           use_custom_sort_vjp,
       )
       reshaped_weights = jnp.reshape(weights, (-1, self.num_experts_per_tok))
+      if self.config.moe_permutation_group_align_size > 0:
+        num_real_tokens = reshaped_weights.shape[0] * self.num_experts_per_tok
+        unsort_intermediate = unsort_intermediate[:num_real_tokens]
       reshaped_intermediate = jnp.reshape(
           unsort_intermediate,
           (reshaped_weights.shape[0], self.num_experts_per_tok, -1),
@@ -1079,7 +1113,7 @@ class RoutedMoE(nnx.Module):
     return output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
 
   def permute(self, inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp=True, rngs=None,
-              roll_to_expert_id=None, gate_expert_bias=None, num_experts_per_shard=None):
+              roll_to_expert_id=None, gate_expert_bias=None, num_experts_per_shard=None, input_ids=None):
     """Permute tokens to group by expert. Dispatches to TE or MT implementation.
 
     Returns:
@@ -1106,8 +1140,8 @@ class RoutedMoE(nnx.Module):
 
     else:
       (x, perm_state.sorted_selected_experts, perm_state.weights, group_sizes,
-       selected_experts, lb_loss, bias_updates) = self._mt_permute(
-          inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp, rngs, roll_to_expert_id,
+       selected_experts, lb_loss, bias_updates, perm_state.local_group_sizes) = self._mt_permute(
+          inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp, rngs, roll_to_expert_id, input_ids,
       )
 
     return x, perm_state, group_sizes, selected_experts, lb_loss, bias_updates
@@ -1149,6 +1183,7 @@ class RoutedMoE(nnx.Module):
           batch_size,
           sequence_length,
           use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+          group_sizes=group_sizes,
       )
 
   def local_permute(self, x, perm_state, all_shards_tokens_per_expert,
@@ -1185,7 +1220,9 @@ class RoutedMoE(nnx.Module):
           local_expert_size, shard_index=shard_index,
           is_offset=is_offset, global_sorted_experts=global_sorted_experts,
           use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+          use_ragged_sort=self.config.use_ragged_sort,
       )
+    perm_state.local_group_sizes = group_sizes
     return x, group_sizes, selected_experts
 
   def local_unpermute(self, intermediate_output, perm_state):
@@ -1205,6 +1242,13 @@ class RoutedMoE(nnx.Module):
           perm_state.inverse_chunk_indices,
       )
     else:
+      if self.config.use_ragged_sort:
+        valid_end = jnp.sum(perm_state.local_group_sizes).astype(jnp.int32)
+        return a2a_ragged_unsort(
+            intermediate_output,
+            jnp.argsort(perm_state.local_sorted_indices),
+            valid_end,
+        )
       return _sort_activations(
           intermediate_output,
           jnp.argsort(perm_state.local_sorted_indices),
@@ -1383,7 +1427,7 @@ class RoutedMoE(nnx.Module):
     sorted_inputs, sort_map = te_permutation.te_sort_chunks_by_expert(
         inputs, split_sizes, sorted_chunk_indices
     )
-    
+
     # Note: The kernel now handles out-of-bounds tokens correctly via identity mapping.
     # No additional masking is needed here.
 
@@ -1601,6 +1645,7 @@ class RoutedMoE(nnx.Module):
       w1_bias,
       wo_bias,
       input_ids=None,
+      gate_expert_bias=None,
   ):
     """Perform sparse matrix multiplication of inputs and Experts."""
 
@@ -1863,7 +1908,7 @@ class RoutedMoE(nnx.Module):
     ) = get_routed_moe_shardings(is_batch_sharded_by_expert, input_ids is not None)
     w0_pspec, w1_pspec, wo_pspec = maybe_aqt_partition(w0_kernel, w0_pspec, w1_kernel, w1_pspec, wo_kernel, wo_pspec)
 
-    def route(x, logits, pre_bias_logits, rngs, input_ids=None):
+    def route(x, logits, pre_bias_logits, rngs, input_ids=None, gate_expert_bias=None):
       """Performs both across device and within device token routing/sorting"""
       num_ep = self.get_expert_parallelism_size()
       expert_shard_id = jax.lax.axis_index(self._expert_parallelism_name) if num_ep > 1 else 0
@@ -1873,6 +1918,7 @@ class RoutedMoE(nnx.Module):
       reshaped_group_sizes = None
       hybrid_ep_routing_map = None
       hybrid_ep_dispatched_probs = None
+      perm_state = None
 
       if self.config.use_hybrid_ep:
         # DeepEP handles dispatch, all-to-all, and local permutation in one fused call.
@@ -1936,36 +1982,34 @@ class RoutedMoE(nnx.Module):
 
         # "Route" tokens within each shard.
         num_experts_per_shard = self.config.num_experts // num_ep
-        (
-            x,
-            sorted_selected_experts,
-            weights,
-            group_sizes,
-            selected_experts,
-            lb_loss,
-            bias_updates,
-            local_group_sizes,
-        ) = self.permute(
+        x, perm_state, group_sizes, selected_experts, lb_loss, bias_updates = self.permute(
             x,
             logits,
             pre_bias_logits,
             self.config.use_custom_sort_vjp,
             roll_to_expert_id=num_experts_per_shard * expert_shard_id,
             rngs=rngs,
+            gate_expert_bias=gate_expert_bias,
+            num_experts_per_shard=num_experts_per_shard,
             input_ids=input_ids,
         )
+        sorted_selected_experts = perm_state.sorted_selected_experts
+        weights = perm_state.weights
+        local_group_sizes = perm_state.local_group_sizes
 
       else:
-        (
+        x, perm_state, group_sizes, selected_experts, lb_loss, bias_updates = self.permute(
             x,
-            sorted_selected_experts,
-            weights,
-            group_sizes,
-            selected_experts,
-            lb_loss,
-            bias_updates,
-            local_group_sizes,
-        ) = self.permute(x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs, input_ids=input_ids)
+            logits,
+            pre_bias_logits,
+            self.config.use_custom_sort_vjp,
+            rngs,
+            gate_expert_bias=gate_expert_bias,
+            input_ids=input_ids,
+        )
+        sorted_selected_experts = perm_state.sorted_selected_experts
+        weights = perm_state.weights
+        local_group_sizes = perm_state.local_group_sizes
 
         if num_ep > 1:
           batch_axis = self._expert_parallelism_name if is_batch_sharded_by_expert else "data"
@@ -1976,8 +2020,11 @@ class RoutedMoE(nnx.Module):
 
           if is_batch_sharded_by_expert:
             all_shards_group_sizes = jax.lax.all_gather(reshaped_group_sizes, axis_name=batch_axis)
-            input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
-                all_shards_group_sizes,
+            perm_state.all_shards_tokens_per_expert = jax.lax.all_gather(
+                group_sizes[None, :], axis_name=self._expert_parallelism_name, axis=0, tiled=True
+            )
+            input_offsets, send_sizes, output_offsets, recv_sizes = te_permutation.compute_ragged_all_to_all_params(
+                perm_state.all_shards_tokens_per_expert,
                 expert_shard_id,
                 num_ep,
             )
@@ -2000,27 +2047,29 @@ class RoutedMoE(nnx.Module):
                 recv_sizes,
                 axis_name=self._expert_parallelism_name,
             )
-            global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=self._expert_parallelism_name)
-            x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
+            x, group_sizes, selected_experts = self.local_permute(
                 x,
-                global_group_sizes,
+                perm_state,
+                perm_state.all_shards_tokens_per_expert,
                 local_expert_size,
-                shard_index=expert_shard_id,
-                use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-                use_ragged_sort=self.config.use_ragged_sort,
+                expert_shard_id,
+                num_ep,
             )
+            local_sorted_indices = perm_state.local_sorted_indices
 
           else:
-            x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
+            perm_state.all_shards_tokens_per_expert = global_group_sizes[None, :]
+            x, group_sizes, selected_experts = self.local_permute(
                 x,
-                global_group_sizes[None, :],
+                perm_state,
+                perm_state.all_shards_tokens_per_expert,
                 local_expert_size,
-                shard_index=expert_shard_id,
+                expert_shard_id,
+                num_ep,
                 is_offset=True,
                 global_sorted_experts=selected_experts,
-                use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-                use_ragged_sort=self.config.use_ragged_sort,
             )
+            local_sorted_indices = perm_state.local_sorted_indices
 
       return (
           x,
@@ -2034,6 +2083,7 @@ class RoutedMoE(nnx.Module):
               hybrid_ep_routing_map=hybrid_ep_routing_map,
               hybrid_ep_dispatched_probs=hybrid_ep_dispatched_probs,
               local_group_sizes=local_group_sizes,
+              perm_state=perm_state,
           ),
           RouteMetadata(
               expert_shard_id=expert_shard_id,
@@ -2138,8 +2188,11 @@ class RoutedMoE(nnx.Module):
       """Return a partial GMM function with preconfigured routing params."""
       num_ep = self.get_expert_parallelism_size()
       num_experts_per_shard = self.config.num_experts // num_ep
-      if self.config.use_ring_of_experts and x.shape[0] < routing.sorted_selected_experts.shape[0]:
-        local_group_sizes = routing.local_group_sizes
+      if self.config.use_ring_of_experts and (
+          routing.perm_state.use_te
+          or x.shape[0] < routing.sorted_selected_experts.shape[0]
+      ):
+        local_group_sizes = routing.group_sizes if routing.perm_state.use_te else routing.local_group_sizes
         return functools.partial(
             gmm,
             group_sizes=local_group_sizes,
@@ -2237,10 +2290,18 @@ class RoutedMoE(nnx.Module):
         check_vma=self.config.check_vma,
     )
     def sparse_matmul_route_and_compute(
-        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs
+        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs,
+        sharded_gate_expert_bias,
     ):
       batch_size, sequence_length, _ = x.shape
-      x, routing, route_metadata = route(x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids)
+      x, routing, route_metadata = route(
+          x,
+          logits,
+          pre_bias_logits,
+          rngs,
+          input_ids=sharded_input_ids,
+          gate_expert_bias=sharded_gate_expert_bias,
+      )
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
@@ -2283,15 +2344,13 @@ class RoutedMoE(nnx.Module):
       if self.config.use_ring_of_experts:
         # Unsort and deduplicate the outputs locally.
         # Use all-gathered batch size (batch_size * EP) since inputs were all-gathered.
-        gathered_batch_size = batch_size * num_expert_parallelism
+        gathered_batch_size = batch_size * self.get_expert_parallelism_size()
         output = self.unpermute(
             intermediate_output,
-            routing.sorted_selected_experts,
-            routing.weights,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
-            use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-            group_sizes=routing.group_sizes,
+            routing.perm_state,
+            routing.group_sizes,
+            gathered_batch_size,
+            sequence_length,
         )
 
         # Sum up the partial outputs across the expert shards.
@@ -2303,32 +2362,55 @@ class RoutedMoE(nnx.Module):
 
       if self.get_expert_parallelism_size() > 1:
         original_inputs_first_dim = batch_size * sequence_length * self.config.num_experts_per_tok
-        if routing.sorted_selected_experts.shape[0] != original_inputs_first_dim:
-          raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
+        reverse_buffer_size = original_inputs_first_dim
+        align_size = self.config.moe_permutation_group_align_size
+        if align_size > 0:
+          reverse_buffer_size += int(self.num_experts * (align_size - 1))
+        if (
+            not routing.perm_state.use_te
+            and routing.perm_state.sorted_selected_experts.shape[0] != reverse_buffer_size
+        ):
+          raise ValueError("reverse_buffer_size does not match the permuted tensor shape")
         output_shape = jax.lax.empty(
             (
-                original_inputs_first_dim,
+                reverse_buffer_size,
                 self.moe_expert_input_dim // self.get_tensor_parallelism_size(),
             ),
             dtype=intermediate_output.dtype,
         )
 
-        intermediate_output = unsort_output_and_ra2a(
+        intermediate_output = self.local_unpermute(intermediate_output, routing.perm_state)
+        if is_batch_sharded_by_expert:
+          input_offsets, send_sizes, output_offsets, recv_sizes = (
+              te_permutation.compute_reverse_ragged_all_to_all_params(
+                  routing.perm_state.all_shards_tokens_per_expert,
+                  route_metadata.expert_shard_id,
+                  self.get_expert_parallelism_size(),
+              )
+          )
+        else:
+          input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
+              route_metadata.reshaped_group_sizes,
+              route_metadata.expert_shard_id,
+              self.get_expert_parallelism_size(),
+              is_batch_sharded=False,
+          )
+        intermediate_output = jax.lax.ragged_all_to_all(
             intermediate_output,
-            routing,
-            route_metadata,
             output_shape,
-            is_batch_sharded_by_expert,
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            recv_sizes,
+            axis_name=self._expert_parallelism_name,
         )
 
       output = self.unpermute(
           intermediate_output,
-          routing.sorted_selected_experts,
-          routing.weights,
-          batch_size=batch_size,
-          sequence_length=sequence_length,
-          use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-          group_sizes=routing.group_sizes,
+          routing.perm_state,
+          routing.group_sizes,
+          batch_size,
+          sequence_length,
       )
 
       return output, routing.lb_loss, routing.bias_updates
@@ -2390,6 +2472,7 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         input_ids,
         self.rngs,
+        gate_expert_bias,
     )
 
   def reshape_and_update_weights(self, weights, indices):
@@ -3131,9 +3214,20 @@ class RoutedMoE(nnx.Module):
     """
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
+    if cfg.te_moe_block and gate_inputs is not None:
+      raise ValueError("te_moe_block=True does not support separate gate_inputs.")
+    if cfg.te_moe_block and quantizations.in_serve_mode(self.quant):
+      raise ValueError("te_moe_block=True does not support serve-mode quantized weights.")
     gate_dtype = jnp.float32 if cfg.float32_gate_logits else cfg.dtype
     routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(gate_dtype)
-    gate_logits, pre_bias_logits = self.gate(routing_inputs)
+    use_te_router = cfg.te_router_and_permutation_impl
+    if use_te_router:
+      gate_logits, _ = self.gate(routing_inputs, return_raw_logits=True)
+      pre_bias_logits = None
+      gate_expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32) if self.gate.bias is not None else None
+    else:
+      gate_logits, pre_bias_logits = self.gate(routing_inputs)
+      gate_expert_bias = None
 
     wo_kernel = jnp.asarray(self.wo[...], self.dtype)
 
@@ -3166,6 +3260,21 @@ class RoutedMoE(nnx.Module):
     else:
       w0_bias, w1_bias, wo_bias = None, None, None
 
+    if cfg.te_moe_block:
+      gate_kernel = jnp.asarray(self.gate.kernel[...], self.dtype)
+      output, lb_loss, bias_updates = self._te_moe_block(
+          inputs,
+          gate_kernel,
+          w0_kernel,
+          w1_kernel,
+          wo_kernel,
+          w0_bias,
+          w1_bias,
+          wo_bias,
+          out_sharding,
+      )
+      return output, lb_loss, bias_updates
+
     # vllm_rpa codepath uses fused_moe_func from tpu_inference for optimized inference.
     # The fused MoE kernel currently only supports standard Top-K routing with associated
     # weights. Hash routed layers bypass this kernel and fall back
@@ -3188,7 +3297,17 @@ class RoutedMoE(nnx.Module):
             wo_bias,
         )
       output, lb_loss, bias_updates = self.sparse_matmul(
-          inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, input_ids
+          inputs,
+          gate_logits,
+          pre_bias_logits,
+          w0_kernel,
+          w1_kernel,
+          wo_kernel,
+          w0_bias,
+          w1_bias,
+          wo_bias,
+          input_ids,
+          gate_expert_bias,
       )
     else:
       output, lb_loss, bias_updates = self.dense_matmul(

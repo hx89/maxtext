@@ -1513,19 +1513,20 @@ def setup_initial_state(
     else:
       init_state_partial = init_state_fn
       init_state_partial.__name__ = "initialize_state"
-      if config.pure_nnx:
-        state = jax.jit(
-            lambda: nnx.state(init_state_partial()),  # Get state only, mapping to out_sharding structure
-            in_shardings=None,
-            out_shardings=state_mesh_shardings,
-        )()
-      else:
-        # pylint: disable=not-callable
-        state = jax.jit(
-            init_state_partial,
-            in_shardings=None,
-            out_shardings=state_mesh_shardings,
-        )()
+      with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        if config.pure_nnx:
+          state = jax.jit(
+              lambda: nnx.state(init_state_partial()),  # Get state only, mapping to out_sharding structure
+              in_shardings=None,
+              out_shardings=state_mesh_shardings,
+          )()
+        else:
+          # pylint: disable=not-callable
+          state = jax.jit(
+              init_state_partial,
+              in_shardings=None,
+              out_shardings=state_mesh_shardings,
+          )()
       if raw_params:  # If we loaded a partial state, we need to merge it.
         if config.pure_nnx:
           # raw_params should have the same sharding info as in the model
